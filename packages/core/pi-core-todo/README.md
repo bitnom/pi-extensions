@@ -11,7 +11,7 @@ Flat or arbitrarily nested todos for [Pi](https://github.com/earendil-works/pi),
 pi install npm:@arhen/pi-core-todo
 ```
 
-Registers `todo` and `/todos`; use only one todo extension at a time. `/todos collapse`, `/todos expand`, and `/todos toggle` control the inline widget; bare `/todos` opens the browser.
+Registers `todo`, `/todos`, `/todos-persist-toggle`, and `alt+t`; use only one todo extension at a time. `/todos collapse`, `/todos expand`, and `/todos toggle` control the inline widget, and `alt+t` toggles it from anywhere in the editor; bare `/todos` opens the browser.
 
 ## Nested todos
 
@@ -57,6 +57,10 @@ todo → #7.b.b
 
 The above-editor widget uses at most **8 total lines or one quarter of the terminal height**, whichever is smaller. Short panes shrink it to a summary/active row; panes below four rows hide it. Active tasks and their ancestor context take priority over unrelated rows. Completed rows hide after the next agent turn without changing progress totals.
 
+Deep indentation compresses with an explicit depth marker; long display paths compress in tool headings. Subjects are sanitized and truncated by visible terminal columns, including ANSI styling, wide characters, and emoji.
+
+Tool calls are single-line previews. Results remain bounded even when expanded: at most 5 collapsed or 8 expanded lines, reduced further for short panes. Mutations show the affected task rather than repeating the whole list. Model-facing `list` output shows up to 100 tasks; `get` provides individual details.
+
 ### Collapsing the widget
 
 Collapse the widget to a single summary line — chevron, progress counts, and the active task — with `/todos collapse`. `/todos expand` restores the tree and also reveals completed rows hidden after earlier turns; `/todos toggle` flips the current state.
@@ -65,11 +69,22 @@ Collapse the widget to a single summary line — chevron, progress counts, and t
 ▸ ● Todos (2/12) · ◐ Reject cycles · click or /todos
 ```
 
-In fullscreen mode the widget takes clicks: a left click toggles collapse, and the header advertises it. Terminals that do not report mouse input, and the regular (non-fullscreen) screen mode, keep the command and the chevron as the only affordances. Collapse state is per-process, not persisted.
+In fullscreen mode the widget takes clicks: a left click toggles collapse, and the header advertises it. Terminals that do not report mouse input, and the regular (non-fullscreen) screen mode, keep `alt+t` and the command as the only affordances.
 
-Deep indentation compresses with an explicit depth marker; long display paths compress in tool headings. Subjects are sanitized and truncated by visible terminal columns, including ANSI styling, wide characters, and emoji.
+### Remembering the collapse state
 
-Tool calls are single-line previews. Results remain bounded even when expanded: at most 5 collapsed or 8 expanded lines, reduced further for short panes. Mutations show the affected task rather than repeating the whole list. Model-facing `list` output shows up to 100 tasks; `get` provides individual details.
+The collapsed state is per-process by default: a new session starts expanded. `/todos-persist-toggle` flips a global switch that stores the decision in `<agent-dir>/todo-config.json` instead, so the next start matches what was on screen when the session ended. `/todos-persist-toggle on` and `off` set it explicitly; bare `/todos-persist-toggle` toggles. Enabling persistence records the state visible at that moment and applies from the next start, not retroactively to the current widget. Turning it off leaves the stored decision in place, so turning it back on resumes from where it was.
+
+The file is global, not per-session, and is read once at load:
+
+```json
+{
+  "persistCollapsed": true,
+  "collapsed": false
+}
+```
+
+`persistCollapsed` remembers the decision; `collapsed` is the decision itself. A missing, unreadable or malformed file falls back to the per-process default. Pi 1.4 has no way for an extension to add a row to `/settings` — `SettingsSelectorComponent` has a fixed option list and `ExtensionAPI` only exposes `getSettings()` — so this file and the command are the whole surface. `alt+t` and the widget click both write through it.
 
 ### `/todos` browser
 

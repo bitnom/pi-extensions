@@ -5,14 +5,27 @@ import type { TaskState } from "./types.ts";
 import { WIDGET_KEY } from "./types.ts";
 import { renderWidget } from "./view.ts";
 
+export interface TodoOverlayOptions {
+	/** Collapsed state to start with; the caller passes the remembered decision. */
+	initialCollapsed?: boolean;
+	/** Called after a user-driven collapse or expand, so the caller can remember it. */
+	onCollapsedChange?(collapsed: boolean): void;
+}
+
 export class TodoOverlay {
 	private uiCtx: ExtensionUIContext | undefined;
 	private widgetRegistered = false;
 	private tui: TUI | undefined;
-	private collapsed = false;
+	private collapsed: boolean;
+	private readonly onCollapsedChange: ((collapsed: boolean) => void) | undefined;
 	private completedTaskIdsPendingHide = new Set<number>();
 	private hiddenCompletedTaskIds = new Set<number>();
 	private lastNextId: number | undefined;
+
+	constructor(options: TodoOverlayOptions = {}) {
+		this.collapsed = options.initialCollapsed ?? false;
+		this.onCollapsedChange = options.onCollapsedChange;
+	}
 
 	get terminalRows(): number {
 		return this.tui?.terminal.rows ?? process.stdout.rows ?? 32;
@@ -35,6 +48,7 @@ export class TodoOverlay {
 		if (this.collapsed === collapsed) return;
 		this.collapsed = collapsed;
 		if (!collapsed) this.hiddenCompletedTaskIds.clear();
+		this.onCollapsedChange?.(collapsed);
 		this.update();
 	}
 
