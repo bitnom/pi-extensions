@@ -133,8 +133,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand(COMMAND_NAME, {
-		description: "Browse the todo tree: scroll, expand, and collapse branches",
-		handler: async (_args, ctx) => {
+		description: "Browse the todo tree, or collapse/expand the inline widget: /todos [collapse|expand|toggle]",
+		handler: async (args, ctx) => {
+			const mode = args.trim().toLowerCase();
+			if (mode === "collapse" || mode === "expand" || mode === "toggle") {
+				overlay.setCollapsed(mode === "toggle" ? !overlay.isCollapsed() : mode === "collapse");
+				return;
+			}
 			if (!ctx.hasUI) return;
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/todos tree browser requires interactive mode", "info");

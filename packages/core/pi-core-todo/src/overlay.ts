@@ -9,6 +9,7 @@ export class TodoOverlay {
 	private uiCtx: ExtensionUIContext | undefined;
 	private widgetRegistered = false;
 	private tui: TUI | undefined;
+	private collapsed = false;
 	private completedTaskIdsPendingHide = new Set<number>();
 	private hiddenCompletedTaskIds = new Set<number>();
 	private lastNextId: number | undefined;
@@ -23,6 +24,22 @@ export class TodoOverlay {
 			this.widgetRegistered = false;
 			this.tui = undefined;
 		}
+	}
+
+	isCollapsed(): boolean {
+		return this.collapsed;
+	}
+
+	/** Collapse or expand the widget. Expanding on purpose reveals completed rows hidden after earlier turns. */
+	setCollapsed(collapsed: boolean): void {
+		if (this.collapsed === collapsed) return;
+		this.collapsed = collapsed;
+		if (!collapsed) this.hiddenCompletedTaskIds.clear();
+		this.update();
+	}
+
+	toggleCollapsed(): void {
+		this.setCollapsed(!this.collapsed);
 	}
 
 	update(): void {
@@ -42,6 +59,7 @@ export class TodoOverlay {
 				WIDGET_KEY,
 				(tui, factoryTheme) => {
 					this.tui = tui;
+					const clickable = tui.mode === "fullscreen";
 					return {
 						render: (width) => {
 							const state = getRenderState();
@@ -52,12 +70,18 @@ export class TodoOverlay {
 								this.uiCtx?.theme ?? factoryTheme,
 								width,
 								tui.terminal.rows,
+								{ collapsed: this.collapsed, clickable },
 							);
 							for (const id of result.displayedIds) {
 								if (state.tasks.find((task) => task.id === id)?.status === "completed")
 									this.completedTaskIdsPendingHide.add(id);
 							}
 							return result.lines;
+						},
+						handleMouse: (event) => {
+							if (!clickable || event.type !== "click" || event.button !== "left") return undefined;
+							this.toggleCollapsed();
+							return { handled: true };
 						},
 						invalidate: () => {},
 					};

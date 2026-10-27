@@ -11,7 +11,7 @@ Flat or arbitrarily nested todos for [Pi](https://github.com/earendil-works/pi),
 pi install npm:@arhen/pi-core-todo
 ```
 
-Registers `todo` and `/todos`; use only one todo extension at a time.
+Registers `todo` and `/todos`; use only one todo extension at a time. `/todos collapse`, `/todos expand`, and `/todos toggle` control the inline widget; bare `/todos` opens the browser.
 
 ## Nested todos
 
@@ -56,6 +56,16 @@ todo → #7.b.b
 ```
 
 The above-editor widget uses at most **8 total lines or one quarter of the terminal height**, whichever is smaller. Short panes shrink it to a summary/active row; panes below four rows hide it. Active tasks and their ancestor context take priority over unrelated rows. Completed rows hide after the next agent turn without changing progress totals.
+
+### Collapsing the widget
+
+Collapse the widget to a single summary line — chevron, progress counts, and the active task — with `/todos collapse`. `/todos expand` restores the tree and also reveals completed rows hidden after earlier turns; `/todos toggle` flips the current state.
+
+```text
+▸ ● Todos (2/12) · ◐ Reject cycles · click or /todos
+```
+
+In fullscreen mode the widget takes clicks: a left click toggles collapse, and the header advertises it. Terminals that do not report mouse input, and the regular (non-fullscreen) screen mode, keep the command and the chevron as the only affordances. Collapse state is per-process, not persisted.
 
 Deep indentation compresses with an explicit depth marker; long display paths compress in tool headings. Subjects are sanitized and truncated by visible terminal columns, including ANSI styling, wide characters, and emoji.
 
