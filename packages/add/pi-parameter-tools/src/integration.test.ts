@@ -10,6 +10,14 @@
 // the test drives that command over pi's own control channel. A slash command runs
 // in-process, so no provider is called: a parameter change is not a completion.
 //
+// **The fixture is hermetic.** Each child pi gets its own home, its own pi
+// configuration directory, its own session store and its own runtime directory, and it
+// inherits nothing but PATH from this process: no operator settings, no operator model
+// catalog, no ambient credential. The configuration holds one **fake** provider with
+// two fake models and a literal key that is not a credential, and the provider's base
+// url points at a local server that records every request — so "no provider call" is
+// proven by the absence of a request, not assumed.
+//
 // No lane of the running fleet is touched, and every session lives in a temporary
 // directory.
 //
@@ -18,8 +26,9 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChannelRequest, sendRequest, socketPathFor } from "./channel.ts";
@@ -55,7 +64,50 @@ export default function driver(pi: any): void {
 }
 `;
 
-/** A disposable session: a header, a model, a level, and one message so pi persists it. */
+/* -------------------------------------------------------------------------- */
+/* the hermetic fixture                                                        */
+/* -------------------------------------------------------------------------- */
+
+/** The provider the disposable sessions use: a fake one, in an isolated pi config. */
+const TEST_PROVIDER = "ft55-test";
+/** The model every disposable session starts with. */
+const BASE_MODEL = "ft55-model-a";
+/** The model the model test switches the target to. */
+const OTHER_MODEL = "ft55-model-b";
+/** The thinking level every disposable session starts with. */
+const BASE_THINKING = "off";
+
+/** A key that is not a credential: the provider is configured, and nothing is reachable. */
+const FAKE_KEY = "ft55-fake-key-not-a-credential";
+
+/** The thinking levels the fixture models support. "off" is supported by omission. */
+const FIXTURE_THINKING_MAP = {
+	minimal: "minimal",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+} as const;
+
+function fixtureModel(id: string, name: string) {
+	return {
+		id,
+		name,
+		reasoning: true,
+		thinkingLevelMap: { ...FIXTURE_THINKING_MAP },
+		input: ["text"],
+		contextWindow: 100000,
+		maxTokens: 10000,
+	};
+}
+
+/**
+ * The disposable session's own baseline, written into the session file.
+ *
+ * The model and the thinking level are stated by the session itself, so the fixture
+ * does not depend on what a default would be on the machine that runs it.
+ */
 function writeDisposableSession(dir: string, name: string, id: string): string {
 	const path = join(dir, name);
 	const lines = [
@@ -65,15 +117,15 @@ function writeDisposableSession(dir: string, name: string, id: string): string {
 			id: "m0000001",
 			parentId: null,
 			timestamp: "2026-11-12T00:00:00.000Z",
-			provider: "test-provider",
-			modelId: "test-model",
+			provider: TEST_PROVIDER,
+			modelId: BASE_MODEL,
 		},
 		{
 			type: "thinking_level_change",
 			id: "t0000001",
 			parentId: "m0000001",
 			timestamp: "2026-11-12T00:00:00.000Z",
-			thinkingLevel: "off",
+			thinkingLevel: BASE_THINKING,
 		},
 		{
 			type: "message",
@@ -87,21 +139,58 @@ function writeDisposableSession(dir: string, name: string, id: string): string {
 	return path;
 }
 
+/** The isolated pi configuration: one fake provider, two fake models, one fake key. */
+function writeIsolatedPiConfig(agentDir: string, baseUrl: string): void {
+	writeFileSync(
+		join(agentDir, "models.json"),
+		`${JSON.stringify({
+			providers: {
+				[TEST_PROVIDER]: {
+					name: "FT55 Test Provider",
+					baseUrl,
+					api: "openai-completions",
+					apiKey: FAKE_KEY,
+					models: [fixtureModel(BASE_MODEL, "FT55 Model A"), fixtureModel(OTHER_MODEL, "FT55 Model B")],
+				},
+			},
+		})}\n`,
+	);
+	writeFileSync(
+		join(agentDir, "settings.json"),
+		`${JSON.stringify({
+			defaultProvider: TEST_PROVIDER,
+			defaultModel: BASE_MODEL,
+			defaultThinkingLevel: BASE_THINKING,
+		})}\n`,
+	);
+}
+
+let workdir = "";
+let agentDir = "";
+let sessionStoreDir = "";
+let runtimeDir = "";
+let driverPath = "";
+
 /**
- * The children's environment: the test's own, without the fleet's place markers.
+ * The child's environment: nothing of the operator's, and nothing of the fleet's.
  *
- * A test child is not a lane of the fleet, so it must not claim to be in one: the
- * holds are decided by the place ids in the environment.
+ * Only PATH and the locale survive, because a test child is not the operator's pi and
+ * not a lane of the fleet: it has its own home, its own configuration, and no
+ * credential of any kind.
  */
 function hermeticEnv(): NodeJS.ProcessEnv {
-	const env = { ...process.env };
-	for (const key of Object.keys(env)) {
-		if (key.startsWith("HERDR_")) delete env[key];
+	const env: NodeJS.ProcessEnv = {};
+	for (const key of ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER", "LOGNAME"]) {
+		const value = process.env[key];
+		if (value !== undefined) env[key] = value;
 	}
+	env.HOME = workdir;
+	env.XDG_RUNTIME_DIR = runtimeDir;
+	env.PI_CODING_AGENT_DIR = agentDir;
+	env.PI_CODING_AGENT_SESSION_DIR = sessionStoreDir;
 	return env;
 }
 
-let driverPath = "";
 /** pi, in RPC mode, with the extension (and the driver) loaded: a session with a receiver. */
 const spawnPi = (command: string, args: string[], options: { stdio: ["pipe", "pipe", "pipe"] }) =>
 	spawn(command, [...args, "--no-extensions", "--extension", driverPath], {
@@ -133,8 +222,6 @@ async function waitFor<T>(
 	}
 }
 
-let workdir = "";
-let runtimeDir = "";
 let sessionA = "";
 let sessionB = "";
 let sessionC = "";
@@ -156,6 +243,12 @@ async function stateOf(session: RpcSession): Promise<Record<string, unknown>> {
 	return (outcome.data ?? {}) as Record<string, unknown>;
 }
 
+/** The model a running session reports about itself. */
+async function modelOf(session: RpcSession): Promise<{ provider?: string; id?: string }> {
+	const state = await stateOf(session);
+	return (state.model ?? {}) as { provider?: string; id?: string };
+}
+
 /**
  * Call the tool inside the caller's own pi process.
  *
@@ -175,6 +268,13 @@ async function callTool(payload: Record<string, unknown>): Promise<Record<string
 }
 
 /** A request sent straight over the local channel, to the target's own receiver. */
+interface ChannelResponseShape {
+	ok: boolean;
+	refusal?: { code: string; message: string };
+	result?: Record<string, unknown>;
+	receiver?: { sessionId: string | null; sessionPath: string | null };
+}
+
 async function askReceiver(sessionId: string, request: Partial<ChannelRequest>): Promise<ChannelResponseShape> {
 	const response = await sendRequest({
 		sessionId,
@@ -191,21 +291,32 @@ async function askReceiver(sessionId: string, request: Partial<ChannelRequest>):
 	return response as ChannelResponseShape;
 }
 
-interface ChannelResponseShape {
-	ok: boolean;
-	refusal?: { code: string; message: string };
-	result?: Record<string, unknown>;
-	receiver?: { sessionId: string | null; sessionPath: string | null };
-}
+/** Every request the fake provider's base url received. It must stay empty. */
+const providerCalls: string[] = [];
+let providerServer: HttpServer | null = null;
 
 beforeAll(async () => {
 	workdir = mkdtempSync(join(tmpdir(), "ft55-sessions-"));
-	runtimeDir = mkdtempSync(join(tmpdir(), "ft55-runtime-"));
+	agentDir = join(workdir, "pi-agent");
+	sessionStoreDir = join(workdir, "pi-sessions");
+	runtimeDir = join(workdir, "pi-runtime");
+	for (const dir of [agentDir, sessionStoreDir, runtimeDir]) mkdirSync(dir, { recursive: true });
 	// The sockets live under the runtime directory, so a test run never touches a
 	// real lane's socket and never collides with one.
 	process.env.XDG_RUNTIME_DIR = runtimeDir;
 	driverPath = join(workdir, "driver.ts");
 	writeFileSync(driverPath, DRIVER_SOURCE);
+
+	// The fake provider's base url: a local server that answers nothing and records
+	// every request. If pi ever called the provider, this test would see it.
+	providerServer = createHttpServer((request, response) => {
+		providerCalls.push(`${request.method ?? "?"} ${request.url ?? "?"}`);
+		response.writeHead(500, { "content-type": "text/plain" });
+		response.end("the ft55 fixture does not serve models");
+	});
+	await new Promise<void>((resolve) => providerServer?.listen(0, "127.0.0.1", resolve));
+	const port = (providerServer?.address() as AddressInfo | null)?.port ?? 0;
+	writeIsolatedPiConfig(agentDir, `http://127.0.0.1:${port}/v1`);
 
 	idA = "aaaaaaaa-0000-4000-8000-00000000000a";
 	idB = "bbbbbbbb-0000-4000-8000-00000000000b";
@@ -238,16 +349,31 @@ afterAll(async () => {
 	for (const session of [caller, target, unrelated, bare]) {
 		if (session) await session.close();
 	}
+	providerServer?.close();
 	if (workdir) rmSync(workdir, { recursive: true, force: true });
 	if (runtimeDir) rmSync(runtimeDir, { recursive: true, force: true });
 });
 
 describe("a change aimed at another running session", () => {
+	test("the fixture is the baseline it claims to be", async () => {
+		// The fixture is hermetic: the sessions start at the stated model and the
+		// stated thinking level, whatever this machine's own settings say.
+		for (const [name, session] of [
+			["caller", caller],
+			["target", target],
+			["unrelated", unrelated],
+		] as [string, RpcSession][]) {
+			const state = await stateOf(session);
+			expect(`${name}:${state.thinkingLevel}`).toBe(`${name}:${BASE_THINKING}`);
+			const model = await modelOf(session);
+			expect(`${name}:${model.provider}/${model.id}`).toBe(`${name}:${TEST_PROVIDER}/${BASE_MODEL}`);
+		}
+	});
+
 	test("changes that session's thinking level, and leaves this one alone", async () => {
 		const beforeA = readFileSync(sessionA, "utf8");
 		const beforeB = readFileSync(sessionB, "utf8");
 		const beforeC = readFileSync(sessionC, "utf8");
-		expect((await stateOf(target)).thinkingLevel).toBe("off");
 
 		const result = await callTool({
 			tool: "set_session_thinking",
@@ -259,17 +385,19 @@ describe("a change aimed at another running session", () => {
 		expect(result.applied).toBe("thinking");
 		// the change was made by the target's own process, not by the caller
 		expect((result.target as { resolution?: { source?: string } }).resolution?.source).toBe("receiver");
-		// the answer is the target's own: before off, after high
+		// the answer is the target's own: before the baseline, after what was asked
 		const thinking = result.thinking as { before: string; after: string };
-		expect(thinking.before).toBe("off");
+		expect(thinking.before).toBe(BASE_THINKING);
 		expect(thinking.after).toBe("high");
 
 		// the target's own running session says so
 		expect((await stateOf(target)).thinkingLevel).toBe("high");
 
 		// the caller did not move, and neither did the unrelated session
-		expect((await stateOf(caller)).thinkingLevel).toBe("off");
-		expect((await stateOf(unrelated)).thinkingLevel).toBe("off");
+		expect((await stateOf(caller)).thinkingLevel).toBe(BASE_THINKING);
+		expect((await stateOf(unrelated)).thinkingLevel).toBe(BASE_THINKING);
+		expect((await modelOf(caller)).id).toBe(BASE_MODEL);
+		expect((await modelOf(unrelated)).id).toBe(BASE_MODEL);
 		expect(readFileSync(sessionA, "utf8")).toBe(beforeA);
 		expect(readFileSync(sessionC, "utf8")).toBe(beforeC);
 		expect(readFileSync(sessionB, "utf8")).not.toBe(beforeB);
@@ -278,37 +406,31 @@ describe("a change aimed at another running session", () => {
 	test("changes that session's model too", async () => {
 		const beforeB = readFileSync(sessionB, "utf8");
 		const beforeA = readFileSync(sessionA, "utf8");
-		const state = await stateOf(target);
-		const current = state.model as { provider?: string; id?: string };
-		const available = await target.getAvailableModels();
-		const models = (available.data as { models?: { provider: string; id: string }[] } | undefined)?.models ?? [];
-		// Another model of the provider that is already in use: that provider has
-		// credentials, so the change is not refused for a missing key.
-		const candidate = models.find((m) => m.provider === current.provider && m.id !== current.id) ?? null;
-		if (!candidate) {
-			console.warn("ft55: no second model of the current provider; the model change is not exercised");
-			return;
-		}
+		const beforeC = readFileSync(sessionC, "utf8");
 
 		const result = await callTool({
 			tool: "set_session_model",
 			request: { sessionId: idB, sessionPath: sessionB },
-			provider: candidate.provider,
-			modelId: candidate.id,
+			provider: TEST_PROVIDER,
+			modelId: OTHER_MODEL,
 		});
 		expect(result.ok).toBe(true);
 		expect(result.changed).toBe(true);
 		// The model changed; the thinking level may have moved with it, because the
 		// new model supports different levels.
 		expect(["model", "both"]).toContain(result.applied as string);
-		expect((result.model as { after?: { modelId?: string } }).after?.modelId).toBe(candidate.id);
+		expect((result.model as { after?: { modelId?: string } }).after?.modelId).toBe(OTHER_MODEL);
+		// the target's own process wrote the record
+		expect((result.records as { modelChangeEntryId?: string | null }).modelChangeEntryId).toBeTruthy();
 
 		// the target's own running session says so
-		expect(((await stateOf(target)).model as { id?: string }).id).toBe(candidate.id);
+		expect((await modelOf(target)).id).toBe(OTHER_MODEL);
 		expect(readFileSync(sessionB, "utf8")).not.toBe(beforeB);
-		// the caller did not move
-		expect((await stateOf(caller)).thinkingLevel).toBe("off");
+		// the caller did not move, and neither did the unrelated session
+		expect((await modelOf(caller)).id).toBe(BASE_MODEL);
+		expect((await modelOf(unrelated)).id).toBe(BASE_MODEL);
 		expect(readFileSync(sessionA, "utf8")).toBe(beforeA);
+		expect(readFileSync(sessionC, "utf8")).toBe(beforeC);
 	});
 });
 
@@ -372,6 +494,7 @@ describe("a target that cannot be changed", () => {
 		});
 		await new Promise<void>((resolve) => server.listen(socketPathFor(id), resolve));
 		try {
+			const started = Date.now();
 			const response = await sendRequest({
 				sessionId: id,
 				request: {
@@ -386,8 +509,15 @@ describe("a target that cannot be changed", () => {
 			});
 			expect(response.ok).toBe(false);
 			expect(response.refusal?.code).toBe("target_timeout");
+			expect(Date.now() - started).toBeLessThan(3000);
 		} finally {
 			server.close();
 		}
+	});
+
+	test("nothing ever called the provider", () => {
+		// The fake provider's base url recorded every request it received. A
+		// parameter change is not a completion: there was no request.
+		expect(providerCalls).toEqual([]);
 	});
 });

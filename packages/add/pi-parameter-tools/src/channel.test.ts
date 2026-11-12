@@ -150,3 +150,85 @@ describe("asking a receiver", () => {
 		}
 	});
 });
+
+describe("which session the request reaches", () => {
+	/** A receiver that answers, and counts what it was asked. */
+	function answeringReceiver(received: string[]): Server {
+		return createServer((socket: Socket) => {
+			socket.on("data", (chunk: Buffer) => {
+				received.push(chunk.toString("utf8").trim());
+				socket.write(`${JSON.stringify({ ok: true, result: { applied: "thinking" } })}\n`);
+				socket.end();
+			});
+		});
+	}
+
+	test("a request for one session reaches that session's receiver, and no other", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ft55-channel-"));
+		const forThis: string[] = [];
+		const forThat: string[] = [];
+		const mine = answeringReceiver(forThis);
+		const theirs = answeringReceiver(forThat);
+		await new Promise<void>((resolve) => mine.listen(socketPathFor(ID, dir), resolve));
+		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, dir), resolve));
+		try {
+			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 2000 });
+			expect(response.ok).toBe(true);
+			// the request went to the session it named, and to no other session
+			expect(forThis).toHaveLength(1);
+			expect(forThat).toHaveLength(0);
+			expect(JSON.parse(forThis[0] ?? "{}").sessionId).toBe(ID);
+		} finally {
+			mine.close();
+			theirs.close();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a target that does not answer times out, and leaves another session's receiver alone", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ft55-channel-"));
+		const forThat: string[] = [];
+		const silent = createServer(() => {
+			// accept, and say nothing
+		});
+		const theirs = answeringReceiver(forThat);
+		await new Promise<void>((resolve) => silent.listen(socketPathFor(ID, dir), resolve));
+		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, dir), resolve));
+		try {
+			const started = Date.now();
+			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 250 });
+			expect(response.ok).toBe(false);
+			expect(response.refusal?.code).toBe("target_timeout");
+			expect(Date.now() - started).toBeLessThan(3000);
+			// the timeout was this target's, and it cost no other session anything
+			expect(forThat).toHaveLength(0);
+		} finally {
+			silent.close();
+			theirs.close();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a session's receiver is reached only by that session's id", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ft55-channel-"));
+		const forThat: string[] = [];
+		const theirs = answeringReceiver(forThat);
+		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, dir), resolve));
+		try {
+			// A request that names one session never reaches another's receiver, not
+			// even when the receiver would have accepted it.
+			const response = await sendRequest({
+				sessionId: ID,
+				request: request({ sessionId: OTHER_ID }),
+				dir,
+				timeoutMs: 1000,
+			});
+			expect(response.ok).toBe(false);
+			expect(response.refusal?.code).toBe("receiver_unavailable");
+			expect(forThat).toHaveLength(0);
+		} finally {
+			theirs.close();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
