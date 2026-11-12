@@ -133,9 +133,55 @@ describe("set_session_thinking", () => {
 		expect(result.target.resolution?.source).toBe("session_file");
 	});
 
-	test("a session running in another process is refused: pi has no channel to it", async () => {
+	test("another session is changed by its own receiver, and the answer is the target's", async () => {
 		const runtime = makeFakeRuntime({
 			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
+			sendToTarget: async (sessionId, request) => ({
+				ok: true,
+				result: {
+					ok: true,
+					tool: request.tool,
+					target: { kind: "session", sessionId, sessionPath: request.sessionPath },
+					model: { before: null, requested: null, after: null },
+					thinking: { before: "off", requested: request.level, after: "high", supported: ["high"] },
+					applied: "thinking",
+					changed: true,
+					records: { modelChangeEntryId: null, thinkingLevelEntryId: "target-record" },
+					disk: { state: "unknown" },
+					effective: "next_request",
+					partial: false,
+					warnings: [],
+				},
+				receiver: { sessionId, sessionPath: request.sessionPath },
+			}),
+		});
+		const result = await applySessionThinking(
+			runtime,
+			"set_session_thinking",
+			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
+			"high",
+		);
+		expect(result.ok).toBe(true);
+		expect(result.applied).toBe("thinking");
+		expect(result.changed).toBe(true);
+		expect(result.thinking.before).toBe("off");
+		expect(result.thinking.after).toBe("high");
+		expect(result.records.thinkingLevelEntryId).toBe("target-record");
+		expect(result.target.resolution?.source).toBe("receiver");
+		// the request went to the target, not to this session
+		expect(runtime.calls.deliveries).toHaveLength(1);
+		expect(runtime.calls.deliveries[0]?.sessionId).toBe("target-id");
+		expect(runtime.calls.deliveries[0]?.request.action).toBe("set_thinking");
+		expect(runtime.calls.setThinkingLevel).toEqual([]);
+	});
+
+	test("a target with no receiver listening is refused, and nothing is changed", async () => {
+		const runtime = makeFakeRuntime({
+			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
+			sendToTarget: async () => ({
+				ok: false,
+				refusal: { code: "receiver_unavailable", message: "the target session is not listening" },
+			}),
 		});
 		const result = await applySessionThinking(
 			runtime,
@@ -144,13 +190,28 @@ describe("set_session_thinking", () => {
 			"high",
 		);
 		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("target_not_reachable");
-		expect(result.refusal?.detail?.capability).toBe("cross_process_session_control");
-		expect(result.refusal?.detail?.targetSessionId).toBe("target-id");
+		expect(result.refusal?.code).toBe("receiver_unavailable");
 		expect(result.changed).toBe(false);
-		// and nothing was changed anywhere
 		expect(runtime.calls.setThinkingLevel).toEqual([]);
-		expect(runtime.calls.setModel).toEqual([]);
+	});
+
+	test("a target that does not answer in time is refused as a timeout", async () => {
+		const runtime = makeFakeRuntime({
+			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
+			sendToTarget: async () => ({
+				ok: false,
+				refusal: { code: "target_timeout", message: "the target session did not answer in time" },
+			}),
+		});
+		const result = await applySessionThinking(
+			runtime,
+			"set_session_thinking",
+			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
+			"high",
+		);
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("target_timeout");
+		expect(runtime.calls.setThinkingLevel).toEqual([]);
 	});
 
 	test("a session file that holds another session is refused", async () => {
@@ -201,7 +262,7 @@ describe("set_session_thinking", () => {
 		expect(runtime.calls.laneResolutions).toEqual([]);
 	});
 
-	test("a lane binding resolves the lane to a session, and then the capability is reported", async () => {
+	test("a lane binding resolves the lane to a session, and the request goes to its receiver", async () => {
 		const runtime = makeFakeRuntime({
 			sessionHeaderIds: { "/tmp/lane/session.jsonl": "target-id" },
 			resolveLane: async () => ({
@@ -216,10 +277,11 @@ describe("set_session_thinking", () => {
 			"high",
 		);
 		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("target_not_reachable");
+		expect(result.refusal?.code).toBe("receiver_unavailable");
 		expect(result.target.resolution?.source).toBe("lane");
 		expect(result.target.resolution?.lane).toBe("lane-a");
 		expect(runtime.calls.laneResolutions).toEqual(["lane-a"]);
+		expect(runtime.calls.deliveries[0]?.sessionId).toBe("target-id");
 		expect(runtime.calls.setThinkingLevel).toEqual([]);
 	});
 
@@ -284,9 +346,31 @@ describe("set_session_model", () => {
 		expect(runtime.calls.setModel).toEqual([{ provider: "anthropic", modelId: "claude-opus-4" }]);
 	});
 
-	test("a session running in another process is refused: pi has no channel to it", async () => {
+	test("another session's model is changed by its own receiver", async () => {
 		const runtime = makeFakeRuntime({
 			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
+			sendToTarget: async (sessionId, request) => ({
+				ok: true,
+				result: {
+					ok: true,
+					tool: request.tool,
+					target: { kind: "session", sessionId, sessionPath: request.sessionPath },
+					model: {
+						before: { provider: "anthropic", modelId: "claude-sonnet-4" },
+						requested: null,
+						after: { provider: "anthropic", modelId: "claude-opus-4" },
+					},
+					thinking: { before: "off", requested: null, after: "off", supported: [] },
+					applied: "model",
+					changed: true,
+					records: { modelChangeEntryId: "target-model-record", thinkingLevelEntryId: null },
+					disk: { state: "unknown" },
+					effective: "next_request",
+					partial: false,
+					warnings: [],
+				},
+				receiver: { sessionId, sessionPath: request.sessionPath },
+			}),
 		});
 		const result = await applySessionModel(
 			runtime,
@@ -295,18 +379,39 @@ describe("set_session_model", () => {
 			"anthropic",
 			"claude-opus-4",
 		);
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("target_not_reachable");
+		expect(result.ok).toBe(true);
+		expect(result.applied).toBe("model");
+		expect(result.changed).toBe(true);
+		expect(result.records.modelChangeEntryId).toBe("target-model-record");
+		expect(runtime.calls.deliveries[0]?.request.action).toBe("set_model");
 		expect(runtime.calls.setModel).toEqual([]);
 	});
 });
 
 describe("isolation", () => {
-	test("a change aimed at another session changes nothing here", async () => {
+	test("a change aimed at another session leaves this session alone", async () => {
 		const runtime = makeFakeRuntime({
 			sessionId: "own-session-id",
 			sessionPath: "/tmp/a/session.jsonl",
 			sessionHeaderIds: { "/tmp/b/session.jsonl": "b-id" },
+			sendToTarget: async (sessionId, request) => ({
+				ok: true,
+				result: {
+					ok: true,
+					tool: request.tool,
+					target: { kind: "session", sessionId, sessionPath: request.sessionPath },
+					model: { before: null, requested: null, after: null },
+					thinking: { before: "off", requested: request.level, after: "high", supported: [] },
+					applied: "thinking",
+					changed: true,
+					records: { modelChangeEntryId: null, thinkingLevelEntryId: "b-record" },
+					disk: { state: "unknown" },
+					effective: "next_request",
+					partial: false,
+					warnings: [],
+				},
+				receiver: { sessionId, sessionPath: request.sessionPath },
+			}),
 		});
 		const result = await applySessionThinking(
 			runtime,
@@ -314,10 +419,11 @@ describe("isolation", () => {
 			{ sessionId: "b-id", sessionPath: "/tmp/b/session.jsonl" },
 			"high",
 		);
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("target_not_reachable");
+		expect(result.ok).toBe(true);
+		// this session did not move; the target did
 		expect(runtime.calls.setThinkingLevel).toEqual([]);
 		expect(runtime.state.thinkingLevel).toBe("off");
+		expect(runtime.calls.deliveries[0]?.sessionId).toBe("b-id");
 	});
 
 	test("and a change aimed at this session changes only this session", async () => {

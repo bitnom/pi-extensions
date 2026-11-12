@@ -19,12 +19,23 @@ interface Registered {
 	execute: (...args: unknown[]) => Promise<unknown>;
 }
 
-function fakeApi(): { api: ExtensionAPI; tools: Map<string, Registered> } {
+function fakeApi(): {
+	api: ExtensionAPI;
+	tools: Map<string, Registered>;
+	handlers: Map<string, (...args: unknown[]) => unknown>;
+} {
 	const tools = new Map<string, Registered>();
+	const handlers = new Map<string, (...args: unknown[]) => unknown>();
 	let thinkingLevel = "off";
 	const api = {
 		registerTool: (tool: Registered) => {
 			tools.set(tool.name, tool);
+		},
+		on: (event: string, handler: (...args: unknown[]) => unknown) => {
+			handlers.set(event, handler);
+			return () => {
+				handlers.delete(event);
+			};
 		},
 		getThinkingLevel: () => thinkingLevel,
 		setThinkingLevel: (level: string) => {
@@ -32,7 +43,7 @@ function fakeApi(): { api: ExtensionAPI; tools: Map<string, Registered> } {
 		},
 		setModel: async () => true,
 	} as unknown as ExtensionAPI;
-	return { api, tools };
+	return { api, tools, handlers };
 }
 
 const fakeContext = {
@@ -86,6 +97,15 @@ describe("the extension", () => {
 			expect(schema).toContain("sessionPath");
 			expect(schema).toContain("lane");
 		}
+	});
+
+	test("the receiver's life is tied to the session's life", () => {
+		const { api, handlers } = fakeApi();
+		parameterTools(api);
+		// The receiver listens for requests from other lanes; it starts with the
+		// session and stops with it, so no socket outlives the session that owns it.
+		expect(handlers.has("session_start")).toBe(true);
+		expect(handlers.has("session_shutdown")).toBe(true);
 	});
 
 	test("the own thinking tool runs end to end against the extension context", async () => {
