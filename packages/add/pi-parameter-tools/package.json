@@ -1,0 +1,46 @@
+{
+	"name": "@arhen/pi-add-parameter-tools",
+	"version": "1.0.0",
+	"type": "module",
+	"description": "pi extension: set the running agent's model and thinking level, and set another pi session's model and thinking level by explicit target binding.",
+	"license": "MIT",
+	"main": "./src/index.ts",
+	"files": [
+		"src",
+		"!src/**/*.test.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"keywords": [
+		"pi",
+		"pi-coding-agent",
+		"pi-extension",
+		"pi-package",
+		"model",
+		"thinking"
+	],
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/arhen/pi-extensions",
+		"directory": "packages/add/pi-parameter-tools"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"test": "bun test",
+		"check": "npm run typecheck && npm run lint && npm test"
+	}
+}

@@ -28,6 +28,7 @@ packages/
 │   ├── pi-add-commandcode/
 │   ├── pi-add-deliberate/
 │   ├── pi-add-mode/
+│   ├── pi-add-parameter-tools/
 │   ├── pi-add-vantis/
 │   ├── pi-add-wafer/
 │   └── pi-senja/
@@ -81,6 +82,7 @@ pi -e npm:@arhen/pi-core-vision
 | [`@arhen/pi-add-commandcode`](packages/add/pi-add-commandcode) | Command Code Provider API: 58 models, dual-endpoint routing, ZDR |
 | [`@arhen/pi-add-deliberate`](packages/add/pi-add-deliberate) | Read-only `/advise` second opinions and research-first `/plan`, saved to a path |
 | [`@arhen/pi-add-mode`](packages/add/pi-add-mode) | Named modes: instructions + tools + model + effort + subagent model, `/mode` and `alt+m` |
+| [`@arhen/pi-add-parameter-tools`](packages/add/pi-parameter-tools) | Set the model and thinking level of this session, or of another named pi session |
 | [`@arhen/pi-add-vantis`](packages/add/pi-add-vantis) | Vantis integration |
 | [`@arhen/pi-add-wafer`](packages/add/pi-add-wafer) | Wafer integration |
 | [`@arhen/pi-senja`](packages/add/pi-senja) | Gruvbox Material Senja theme, Haiku-style header/footer, state-tinted tool panels |
