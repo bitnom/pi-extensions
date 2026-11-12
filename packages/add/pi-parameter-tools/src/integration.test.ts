@@ -26,7 +26,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -59,6 +59,12 @@ export default function driver(pi: any): void {
 					? await applySessionModel(runtime, payload.tool, payload.request, payload.provider, payload.modelId)
 					: await applySessionThinking(runtime, payload.tool, payload.request, payload.level);
 			writeFileSync(payload.out, JSON.stringify(result));
+		},
+	});
+	pi.registerCommand("ft55-reload", {
+		description: "ft55 test driver: reload the extensions, the way /reload does",
+		handler: async (_args: string, ctx: any): Promise<void> => {
+			await ctx.reload();
 		},
 	});
 }
@@ -226,14 +232,22 @@ let sessionA = "";
 let sessionB = "";
 let sessionC = "";
 let sessionD = "";
+let sessionDup1 = "";
+let sessionDup2 = "";
+let sessionLife = "";
 let idA = "";
 let idB = "";
 let idC = "";
 let idD = "";
+let idDup = "";
+let idLife = "";
 let caller: RpcSession;
 let target: RpcSession;
 let unrelated: RpcSession;
 let bare: RpcSession;
+let dupOne: RpcSession;
+let dupTwo: RpcSession;
+let life: RpcSession;
 let callCount = 0;
 
 /** The state a running session reports about itself. */
@@ -275,9 +289,21 @@ interface ChannelResponseShape {
 	receiver?: { sessionId: string | null; sessionPath: string | null };
 }
 
-async function askReceiver(sessionId: string, request: Partial<ChannelRequest>): Promise<ChannelResponseShape> {
+/**
+ * Ask the receiver that owns a session.
+ *
+ * The socket is the pair's: the session id **and** the session file. A request that
+ * names another session travels over that other session's own socket, with its own
+ * pair, so it reaches the process that holds that file.
+ */
+async function askReceiver(
+	sessionId: string,
+	sessionPath: string,
+	request: Partial<ChannelRequest>,
+): Promise<ChannelResponseShape> {
 	const response = await sendRequest({
 		sessionId,
+		sessionPath,
 		request: {
 			requestId: `probe-${Date.now().toString(36)}`,
 			tool: "set_session_thinking",
@@ -322,20 +348,35 @@ beforeAll(async () => {
 	idB = "bbbbbbbb-0000-4000-8000-00000000000b";
 	idC = "cccccccc-0000-4000-8000-00000000000c";
 	idD = "dddddddd-0000-4000-8000-00000000000d";
+	idDup = "99999999-0000-4000-8000-000000000009";
+	idLife = "88888888-0000-4000-8000-000000000008";
 	sessionA = writeDisposableSession(workdir, "a.jsonl", idA);
 	sessionB = writeDisposableSession(workdir, "b.jsonl", idB);
 	sessionC = writeDisposableSession(workdir, "c.jsonl", idC);
 	sessionD = writeDisposableSession(workdir, "d.jsonl", idD);
+	// Two sessions that carry the **same** id and sit on **different** files: a
+	// copied session file keeps the header's id, so one id is not an identity.
+	sessionDup1 = writeDisposableSession(workdir, "dup-1.jsonl", idDup);
+	sessionDup2 = writeDisposableSession(workdir, "dup-2.jsonl", idDup);
+	sessionLife = writeDisposableSession(workdir, "life.jsonl", idLife);
 
 	caller = await openRpcSession({ spawn: spawnPi, sessionPath: sessionA, timeoutMs: 60_000 });
 	target = await openRpcSession({ spawn: spawnPi, sessionPath: sessionB, timeoutMs: 60_000 });
 	unrelated = await openRpcSession({ spawn: spawnPi, sessionPath: sessionC, timeoutMs: 60_000 });
 	bare = await openRpcSession({ spawn: spawnPiBare, sessionPath: sessionD, timeoutMs: 60_000 });
+	dupOne = await openRpcSession({ spawn: spawnPi, sessionPath: sessionDup1, timeoutMs: 60_000 });
+	dupTwo = await openRpcSession({ spawn: spawnPi, sessionPath: sessionDup2, timeoutMs: 60_000 });
+	life = await openRpcSession({ spawn: spawnPi, sessionPath: sessionLife, timeoutMs: 60_000 });
 
 	// Each session with the extension runs a receiver; the one without does not.
-	await waitFor("the caller's receiver", () => (existsSync(socketPathFor(idA)) ? true : null));
-	await waitFor("the target's receiver", () => (existsSync(socketPathFor(idB)) ? true : null));
-	await waitFor("the unrelated session's receiver", () => (existsSync(socketPathFor(idC)) ? true : null));
+	await waitFor("the caller's receiver", () => (existsSync(socketPathFor(idA, sessionA)) ? true : null));
+	await waitFor("the target's receiver", () => (existsSync(socketPathFor(idB, sessionB)) ? true : null));
+	await waitFor("the unrelated session's receiver", () => (existsSync(socketPathFor(idC, sessionC)) ? true : null));
+	await waitFor("the first duplicate's receiver", () => (existsSync(socketPathFor(idDup, sessionDup1)) ? true : null));
+	await waitFor("the second duplicate's receiver", () => (existsSync(socketPathFor(idDup, sessionDup2)) ? true : null));
+	await waitFor("the lifecycle session's receiver", () =>
+		existsSync(socketPathFor(idLife, sessionLife)) ? true : null,
+	);
 	// The driver's command must exist before any prompt: a prompt that is not a
 	// command would reach the model.
 	await waitFor("the driver's command", async () => {
@@ -343,16 +384,16 @@ beforeAll(async () => {
 		const commands = (outcome.data as { commands?: { name?: string }[] } | undefined)?.commands ?? [];
 		return commands.some((command) => command.name === "ft55-call") ? true : null;
 	});
-});
+}, 120_000);
 
 afterAll(async () => {
-	for (const session of [caller, target, unrelated, bare]) {
+	for (const session of [caller, target, unrelated, bare, dupOne, dupTwo, life]) {
 		if (session) await session.close();
 	}
 	providerServer?.close();
 	if (workdir) rmSync(workdir, { recursive: true, force: true });
 	if (runtimeDir) rmSync(runtimeDir, { recursive: true, force: true });
-});
+}, 60_000);
 
 describe("a change aimed at another running session", () => {
 	test("the fixture is the baseline it claims to be", async () => {
@@ -434,6 +475,151 @@ describe("a change aimed at another running session", () => {
 	});
 });
 
+describe("two sessions that carry the same id", () => {
+	test("a change aimed at one of them reaches that one, and leaves the other alone", async () => {
+		// One id, two files, two running processes. An id is not an identity: a
+		// copied session file keeps the header's id. The socket's name is the pair,
+		// so the two are two sockets.
+		expect(socketPathFor(idDup, sessionDup1)).not.toBe(socketPathFor(idDup, sessionDup2));
+		const beforeOne = readFileSync(sessionDup1, "utf8");
+		const beforeTwo = readFileSync(sessionDup2, "utf8");
+
+		const result = await callTool({
+			tool: "set_session_thinking",
+			request: { sessionId: idDup, sessionPath: sessionDup2 },
+			level: "high",
+		});
+		expect(result.ok).toBe(true);
+		expect(result.changed).toBe(true);
+		// the answer is the target's own: its baseline, and what was asked for
+		const thinking = result.thinking as { before: string; after: string };
+		expect(thinking.before).toBe(BASE_THINKING);
+		expect(thinking.after).toBe("high");
+
+		// The process that holds that file changed. The other process, which holds
+		// the same id on another file, did not: the request went to one session,
+		// not to "the session with that id".
+		expect((await stateOf(dupTwo)).thinkingLevel).toBe("high");
+		expect((await stateOf(dupOne)).thinkingLevel).toBe(BASE_THINKING);
+		expect(readFileSync(sessionDup2, "utf8")).not.toBe(beforeTwo);
+		expect(readFileSync(sessionDup1, "utf8")).toBe(beforeOne);
+		// and the caller did not move
+		expect((await stateOf(caller)).thinkingLevel).toBe(BASE_THINKING);
+	});
+
+	test("the other one is reached the same way", async () => {
+		const beforeOne = readFileSync(sessionDup1, "utf8");
+		const beforeTwo = readFileSync(sessionDup2, "utf8");
+
+		const result = await callTool({
+			tool: "set_session_model",
+			request: { sessionId: idDup, sessionPath: sessionDup1 },
+			provider: TEST_PROVIDER,
+			modelId: OTHER_MODEL,
+		});
+		expect(result.ok).toBe(true);
+		expect(result.changed).toBe(true);
+		expect((await modelOf(dupOne)).id).toBe(OTHER_MODEL);
+		expect((await modelOf(dupTwo)).id).toBe(BASE_MODEL);
+		expect(readFileSync(sessionDup1, "utf8")).not.toBe(beforeOne);
+		expect(readFileSync(sessionDup2, "utf8")).toBe(beforeTwo);
+	});
+});
+
+describe("a session that changes its own identity", () => {
+	test("/new moves the receiver to the new session and leaves no socket behind", async () => {
+		const before = await stateOf(life);
+		const beforeId = before.sessionId as string;
+		const beforeFile = before.sessionFile as string;
+		const beforeSocket = socketPathFor(beforeId, beforeFile);
+		expect(existsSync(beforeSocket)).toBe(true);
+
+		const outcome = await life.newSession();
+		expect(outcome.ok).toBe(true);
+
+		const after = await stateOf(life);
+		const afterId = after.sessionId as string;
+		const afterFile = after.sessionFile as string;
+		expect(afterId).not.toBe(beforeId);
+		expect(afterFile).not.toBe(beforeFile);
+		// the old session's socket is gone: it went with the old session
+		expect(existsSync(beforeSocket)).toBe(false);
+		// the new session's receiver is there, and it answers for the new session
+		const afterSocket = socketPathFor(afterId, afterFile);
+		await waitFor("the new session's receiver", () => (existsSync(afterSocket) ? true : null));
+		const response = await sendRequest({
+			sessionId: afterId,
+			sessionPath: afterFile,
+			request: {
+				requestId: "lifecycle-new",
+				tool: "set_session_thinking",
+				sessionId: afterId,
+				sessionPath: afterFile,
+				action: "set_thinking",
+				level: "high",
+			},
+			timeoutMs: 10_000,
+		});
+		expect(response.ok).toBe(true);
+		expect(response.receiver?.sessionPath).toBe(afterFile);
+	}, 60_000);
+
+	test("/resume brings the receiver back to the session it resumes", async () => {
+		const outcome = await life.switchSession(sessionLife);
+		expect(outcome.ok).toBe(true);
+		const state = await stateOf(life);
+		expect(state.sessionFile).toBe(sessionLife);
+		expect(state.sessionId).toBe(idLife);
+		const socket = socketPathFor(idLife, sessionLife);
+		await waitFor("the resumed session's receiver", () => (existsSync(socket) ? true : null));
+		const response = await sendRequest({
+			sessionId: idLife,
+			sessionPath: sessionLife,
+			request: {
+				requestId: "lifecycle-resume",
+				tool: "set_session_thinking",
+				sessionId: idLife,
+				sessionPath: sessionLife,
+				action: "set_thinking",
+				level: "high",
+			},
+			timeoutMs: 10_000,
+		});
+		expect(response.ok).toBe(true);
+		expect(response.receiver?.sessionPath).toBe(sessionLife);
+	}, 60_000);
+
+	test("/reload replaces the receiver, and the socket stays where it is", async () => {
+		const state = await stateOf(life);
+		const socket = socketPathFor(state.sessionId as string, state.sessionFile as string);
+		// The name points at the receiver's own socket. A reload runs the extension
+		// again, so the receiver behind the name is a new one.
+		const before = readlinkSync(socket);
+
+		const outcome = await life.prompt("/ft55-reload");
+		expect(outcome.ok).toBe(true);
+		expect((outcome.data as { disposition?: string } | undefined)?.disposition).toBe("handled");
+
+		await waitFor("the reloaded receiver", () => (existsSync(socket) ? true : null));
+		expect(readlinkSync(socket)).not.toBe(before);
+		const response = await sendRequest({
+			sessionId: state.sessionId as string,
+			sessionPath: state.sessionFile as string,
+			request: {
+				requestId: "lifecycle-reload",
+				tool: "set_session_thinking",
+				sessionId: state.sessionId as string,
+				sessionPath: state.sessionFile as string,
+				action: "set_thinking",
+				level: "high",
+			},
+			timeoutMs: 10_000,
+		});
+		expect(response.ok).toBe(true);
+		expect(response.receiver?.sessionPath).toBe(state.sessionFile as string);
+	}, 60_000);
+});
+
 describe("a target that cannot be changed", () => {
 	test("a running session with no receiver loaded is refused, and nothing is written", async () => {
 		const beforeD = readFileSync(sessionD, "utf8");
@@ -450,7 +636,7 @@ describe("a target that cannot be changed", () => {
 
 	test("a request that names another session is refused by the target itself", async () => {
 		const beforeB = readFileSync(sessionB, "utf8");
-		const response = await askReceiver(idB, { sessionId: idC, sessionPath: sessionC });
+		const response = await askReceiver(idB, sessionB, { sessionId: idC, sessionPath: sessionC });
 		expect(response.ok).toBe(false);
 		expect(response.refusal?.code).toBe("session_id_mismatch");
 		expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
@@ -458,7 +644,7 @@ describe("a target that cannot be changed", () => {
 
 	test("a request that names another session file is refused by the target itself", async () => {
 		const beforeB = readFileSync(sessionB, "utf8");
-		const response = await askReceiver(idB, { sessionId: idB, sessionPath: sessionC });
+		const response = await askReceiver(idB, sessionB, { sessionId: idB, sessionPath: sessionC });
 		expect(response.ok).toBe(false);
 		expect(response.refusal?.code).toBe("session_identity_mismatch");
 		expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
@@ -489,14 +675,16 @@ describe("a target that cannot be changed", () => {
 		// A socket that accepts the connection and never answers: the caller must not
 		// wait forever, and must say that it timed out.
 		const id = "eeeeeeee-0000-4000-8000-00000000000e";
+		const sessionPath = join(workdir, "timeout-probe.jsonl");
 		const server = createServer(() => {
 			// accept, and say nothing
 		});
-		await new Promise<void>((resolve) => server.listen(socketPathFor(id), resolve));
+		await new Promise<void>((resolve) => server.listen(socketPathFor(id, sessionPath), resolve));
 		try {
 			const started = Date.now();
 			const response = await sendRequest({
 				sessionId: id,
+				sessionPath,
 				request: {
 					requestId: "timeout-probe",
 					tool: "set_session_thinking",

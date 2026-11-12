@@ -36,13 +36,40 @@ So this package brings its own, small, local one:
   socket, checks that the request really names *its* session, and applies the change with
   **its own** pi setters. The target session is written by the process that owns it.
 * the **channel** — a UNIX socket whose path is derived from the target's session id
-  (`sha256(id)`, first 16 hex characters), under `$XDG_RUNTIME_DIR/pi-parameter-tools` (or
-  the temporary directory), in a `0700` directory, with the socket itself `0600`. Both
-  sides derive the same path from the same id: there is no registry, no token, no grant
-  file, and no directory to enumerate.
+  **and** its session file (`sha256(id \0 normalised file)`, first 16 hex characters),
+  under `$XDG_RUNTIME_DIR/pi-parameter-tools` (or the temporary directory), in a `0700`
+  directory, with the socket itself `0600`. Both sides derive the same path from the
+  same pair: there is no registry, no token, no grant file, and no directory to
+  enumerate.
 
 The request carries the caller's binding — the session id and the session file — and the
 target checks both against its own identity before it changes anything.
+
+### Who owns the socket
+
+The socket's name is the pair (id, file), and the pair is the session: a copied session
+file keeps the header's id, so two different sessions can carry the same id, and one id
+is not an identity.
+
+The receiver listens on a **private** path and publishes the shared name as a symlink to
+it. Node removes the socket it created when the server closes — by name, and
+unconditionally — so a receiver that listened on the shared name itself would remove
+whatever was at that name, including a socket another owner had taken over. On a private
+path the close removes the receiver's own socket and nothing else, and the shared name is
+removed only while it still points at that receiver.
+
+* A name that already has a listener is **taken over**: the pair names one session, and
+  the process that most recently took that session file is the one that answers for it.
+  The previous owner keeps its own socket, and its later shutdown cannot take the name
+  back.
+* A name left behind by a process that died — a file with no listener — is **replaced**.
+* A request that arrives while the receiver is closing is **answered**: closing stops
+  new connections, it does not cut off the one that is already running.
+
+The receiver follows the session. It starts with the session and closes with it: `/new`
+and `/resume` give the session a new id and file, the receiver moves to the new pair,
+and the old name goes with the old session. `/reload` runs the extension again, so the
+receiver behind the name is a new one, at the same name.
 
 | Target | What happens |
 |---|---|
@@ -196,7 +223,12 @@ told when the other end is gone, busy, or speaks nonsense, and **which** session
 request reaches) and the receiver (what it applies, and what it refuses).
 
 The integration test opens **real disposable pi sessions** in a temporary directory, each
-with this extension loaded, so each one runs its own receiver. The caller is a real pi as
+with this extension loaded, so each one runs its own receiver. Among them are two
+sessions that carry the **same id** on **different files**, and a session that is put
+through `/new`, `/resume` and `/reload`: a change aimed at one of the two is checked to
+land in the process that holds that file — the running session's own state, and the
+file's own bytes — and not in the other one, and the receiver is checked to follow the
+session through the three. The caller is a real pi as
 well: a temporary driver extension registers a command that calls the same function the
 tool calls, and the test drives that command over pi's own control channel. A slash
 command runs in-process, so no provider is called. The test then checks the property that

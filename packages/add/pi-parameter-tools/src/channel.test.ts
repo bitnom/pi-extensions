@@ -13,13 +13,17 @@ import { type ChannelRequest, ensureSocketDir, sendRequest, socketDir, socketPat
 
 const ID = "11111111-2222-3333-4444-555555555555";
 const OTHER_ID = "99999999-8888-7777-6666-555555555555";
+/** The session file of the session being asked. */
+const PATH = "/tmp/ft55/session.jsonl";
+/** Another file that carries the same session id: a copied session file does. */
+const SAME_ID_OTHER_FILE = "/tmp/ft55/copy-of-session.jsonl";
 
 function request(overrides: Partial<ChannelRequest> = {}): ChannelRequest {
 	return {
 		requestId: "req-1",
 		tool: "set_session_thinking",
 		sessionId: ID,
-		sessionPath: "/tmp/ft55/session.jsonl",
+		sessionPath: PATH,
 		action: "set_thinking",
 		level: "high",
 		...overrides,
@@ -27,13 +31,25 @@ function request(overrides: Partial<ChannelRequest> = {}): ChannelRequest {
 }
 
 describe("where the socket is", () => {
-	test("the socket path is derived from the session id, and says nothing about it", () => {
+	test("the socket path is derived from the session id and its file, and says nothing about either", () => {
 		const dir = socketDir();
-		const path = socketPathFor(ID, dir);
-		expect(path).toBe(socketPathFor(ID, dir));
-		expect(path).not.toBe(socketPathFor(OTHER_ID, dir));
+		const path = socketPathFor(ID, PATH, dir);
+		expect(path).toBe(socketPathFor(ID, PATH, dir));
+		expect(path).not.toBe(socketPathFor(OTHER_ID, PATH, dir));
+		// The same id and another file is another session: a copied session file keeps
+		// the header's id, so the id alone does not name a session.
+		expect(path).not.toBe(socketPathFor(ID, SAME_ID_OTHER_FILE, dir));
 		expect(path).not.toContain(ID);
+		expect(path).not.toContain("session.jsonl");
 		expect(path.startsWith(dir)).toBe(true);
+	});
+
+	test("the socket path agrees on one spelling of one file", () => {
+		const dir = socketDir();
+		// The same lexical rule the identity checks use: two spellings of one file
+		// agree here exactly where they agree there.
+		expect(socketPathFor(ID, "/tmp/ft55/./session.jsonl", dir)).toBe(socketPathFor(ID, PATH, dir));
+		expect(socketPathFor(ID, "/tmp/ft55/x/../session.jsonl", dir)).toBe(socketPathFor(ID, PATH, dir));
 	});
 
 	test("the socket directory is the runtime directory, when there is one", () => {
@@ -56,9 +72,9 @@ describe("asking a receiver", () => {
 				socket.end();
 			});
 		});
-		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, dir), resolve));
+		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, PATH, dir), resolve));
 		try {
-			const response = await sendRequest({ sessionId: ID, request: request(), dir });
+			const response = await sendRequest({ sessionId: ID, sessionPath: PATH, request: request(), dir });
 			expect(response.ok).toBe(true);
 			expect(response.result?.applied).toBe("thinking");
 			expect(seen.value?.requestId).toBe("req-1");
@@ -76,7 +92,13 @@ describe("asking a receiver", () => {
 	test("a target that is not listening is reported as unavailable", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ft55-channel-"));
 		try {
-			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 1000 });
+			const response = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request(),
+				dir,
+				timeoutMs: 1000,
+			});
 			expect(response.ok).toBe(false);
 			expect(response.refusal?.code).toBe("receiver_unavailable");
 		} finally {
@@ -89,10 +111,10 @@ describe("asking a receiver", () => {
 		const server: Server = createServer(() => {
 			// accept, and say nothing
 		});
-		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, dir), resolve));
+		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, PATH, dir), resolve));
 		try {
 			const started = Date.now();
-			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 250 });
+			const response = await sendRequest({ sessionId: ID, sessionPath: PATH, request: request(), dir, timeoutMs: 250 });
 			expect(response.ok).toBe(false);
 			expect(response.refusal?.code).toBe("target_timeout");
 			expect(Date.now() - started).toBeLessThan(3000);
@@ -110,9 +132,15 @@ describe("asking a receiver", () => {
 				socket.end();
 			});
 		});
-		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, dir), resolve));
+		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, PATH, dir), resolve));
 		try {
-			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 1000 });
+			const response = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request(),
+				dir,
+				timeoutMs: 1000,
+			});
 			expect(response.ok).toBe(false);
 			expect(response.refusal?.code).toBe("target_protocol_error");
 		} finally {
@@ -128,9 +156,15 @@ describe("asking a receiver", () => {
 				socket.end();
 			});
 		});
-		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, dir), resolve));
+		await new Promise<void>((resolve) => server.listen(socketPathFor(ID, PATH, dir), resolve));
 		try {
-			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 1000 });
+			const response = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request(),
+				dir,
+				timeoutMs: 1000,
+			});
 			expect(response.ok).toBe(false);
 			expect(response.refusal?.code).toBe("target_unreachable");
 		} finally {
@@ -169,10 +203,16 @@ describe("which session the request reaches", () => {
 		const forThat: string[] = [];
 		const mine = answeringReceiver(forThis);
 		const theirs = answeringReceiver(forThat);
-		await new Promise<void>((resolve) => mine.listen(socketPathFor(ID, dir), resolve));
-		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, dir), resolve));
+		await new Promise<void>((resolve) => mine.listen(socketPathFor(ID, PATH, dir), resolve));
+		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, PATH, dir), resolve));
 		try {
-			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 2000 });
+			const response = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request(),
+				dir,
+				timeoutMs: 2000,
+			});
 			expect(response.ok).toBe(true);
 			// the request went to the session it named, and to no other session
 			expect(forThis).toHaveLength(1);
@@ -192,11 +232,11 @@ describe("which session the request reaches", () => {
 			// accept, and say nothing
 		});
 		const theirs = answeringReceiver(forThat);
-		await new Promise<void>((resolve) => silent.listen(socketPathFor(ID, dir), resolve));
-		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, dir), resolve));
+		await new Promise<void>((resolve) => silent.listen(socketPathFor(ID, PATH, dir), resolve));
+		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, PATH, dir), resolve));
 		try {
 			const started = Date.now();
-			const response = await sendRequest({ sessionId: ID, request: request(), dir, timeoutMs: 250 });
+			const response = await sendRequest({ sessionId: ID, sessionPath: PATH, request: request(), dir, timeoutMs: 250 });
 			expect(response.ok).toBe(false);
 			expect(response.refusal?.code).toBe("target_timeout");
 			expect(Date.now() - started).toBeLessThan(3000);
@@ -213,12 +253,13 @@ describe("which session the request reaches", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ft55-channel-"));
 		const forThat: string[] = [];
 		const theirs = answeringReceiver(forThat);
-		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, dir), resolve));
+		await new Promise<void>((resolve) => theirs.listen(socketPathFor(OTHER_ID, PATH, dir), resolve));
 		try {
 			// A request that names one session never reaches another's receiver, not
 			// even when the receiver would have accepted it.
 			const response = await sendRequest({
 				sessionId: ID,
+				sessionPath: PATH,
 				request: request({ sessionId: OTHER_ID }),
 				dir,
 				timeoutMs: 1000,

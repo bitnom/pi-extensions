@@ -2,7 +2,7 @@
 	"name": "@arhen/pi-add-parameter-tools",
 	"version": "1.0.0",
 	"type": "module",
-	"description": "pi extension: set a pi session's model and thinking level, by explicit target binding. The caller's own session is changed in process; another session is changed by its own running pi process, over the local socket that the target's receiver listens on.",
+	"description": "pi extension: set a pi session's model and thinking level, by explicit target binding. The caller's own session is changed in process; another session is changed by its own running pi process, over the local socket that the target's receiver listens on. The socket is named after the target's session id and session file, so two sessions that share an id do not share a socket.",
 	"license": "MIT",
 	"main": "./src/index.ts",
 	"files": [

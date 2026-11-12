@@ -136,12 +136,12 @@ describe("set_session_thinking", () => {
 	test("another session is changed by its own receiver, and the answer is the target's", async () => {
 		const runtime = makeFakeRuntime({
 			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
-			sendToTarget: async (sessionId, request) => ({
+			sendToTarget: async (request) => ({
 				ok: true,
 				result: {
 					ok: true,
 					tool: request.tool,
-					target: { kind: "session", sessionId, sessionPath: request.sessionPath },
+					target: { kind: "session", sessionId: request.sessionId, sessionPath: request.sessionPath },
 					model: { before: null, requested: null, after: null },
 					thinking: { before: "off", requested: request.level, after: "high", supported: ["high"] },
 					applied: "thinking",
@@ -152,7 +152,7 @@ describe("set_session_thinking", () => {
 					partial: false,
 					warnings: [],
 				},
-				receiver: { sessionId, sessionPath: request.sessionPath },
+				receiver: { sessionId: request.sessionId, sessionPath: request.sessionPath },
 			}),
 		});
 		const result = await applySessionThinking(
@@ -349,12 +349,12 @@ describe("set_session_model", () => {
 	test("another session's model is changed by its own receiver", async () => {
 		const runtime = makeFakeRuntime({
 			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
-			sendToTarget: async (sessionId, request) => ({
+			sendToTarget: async (request) => ({
 				ok: true,
 				result: {
 					ok: true,
 					tool: request.tool,
-					target: { kind: "session", sessionId, sessionPath: request.sessionPath },
+					target: { kind: "session", sessionId: request.sessionId, sessionPath: request.sessionPath },
 					model: {
 						before: { provider: "anthropic", modelId: "claude-sonnet-4" },
 						requested: null,
@@ -369,7 +369,7 @@ describe("set_session_model", () => {
 					partial: false,
 					warnings: [],
 				},
-				receiver: { sessionId, sessionPath: request.sessionPath },
+				receiver: { sessionId: request.sessionId, sessionPath: request.sessionPath },
 			}),
 		});
 		const result = await applySessionModel(
@@ -394,12 +394,12 @@ describe("isolation", () => {
 			sessionId: "own-session-id",
 			sessionPath: "/tmp/a/session.jsonl",
 			sessionHeaderIds: { "/tmp/b/session.jsonl": "b-id" },
-			sendToTarget: async (sessionId, request) => ({
+			sendToTarget: async (request) => ({
 				ok: true,
 				result: {
 					ok: true,
 					tool: request.tool,
-					target: { kind: "session", sessionId, sessionPath: request.sessionPath },
+					target: { kind: "session", sessionId: request.sessionId, sessionPath: request.sessionPath },
 					model: { before: null, requested: null, after: null },
 					thinking: { before: "off", requested: request.level, after: "high", supported: [] },
 					applied: "thinking",
@@ -410,7 +410,7 @@ describe("isolation", () => {
 					partial: false,
 					warnings: [],
 				},
-				receiver: { sessionId, sessionPath: request.sessionPath },
+				receiver: { sessionId: request.sessionId, sessionPath: request.sessionPath },
 			}),
 		});
 		const result = await applySessionThinking(

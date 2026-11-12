@@ -56,10 +56,12 @@ export interface ParameterRuntime {
 	/**
 	 * Deliver a request to the target session's receiver and wait for its answer.
 	 *
-	 * Injected so the unit tests can drive the protocol without a socket, and so the
-	 * integration test can deliver to a real running pi.
+	 * The request carries the binding — the session id and the session file — so the
+	 * socket's path is derived from the same pair on both sides. Injected so the unit
+	 * tests can drive the protocol without a socket, and so the integration test can
+	 * deliver to a real running pi.
 	 */
-	sendToTarget(sessionId: string, request: ChannelRequest, options: { timeoutMs?: number }): Promise<ChannelResponse>;
+	sendToTarget(request: ChannelRequest, options: { timeoutMs?: number }): Promise<ChannelResponse>;
 }
 
 export interface SessionRequest extends TargetRequest {
@@ -463,7 +465,7 @@ async function deliverToTarget(
 	};
 	let response: ChannelResponse;
 	try {
-		response = await runtime.sendToTarget(sessionId, request, { timeoutMs: TARGET_TIMEOUT_MS });
+		response = await runtime.sendToTarget(request, { timeoutMs: TARGET_TIMEOUT_MS });
 	} catch (error) {
 		return refusal(tool, "target_unreachable", "the target session could not be reached", target, {
 			cause: error instanceof Error ? error.message : "unknown",

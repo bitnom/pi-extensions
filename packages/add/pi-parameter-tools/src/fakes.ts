@@ -19,11 +19,7 @@ export interface FakeRuntimeOptions {
 	ownRecords?: { modelChangeEntryId: string | null; thinkingLevelEntryId: string | null };
 	resolveLane?: (lane: string) => Promise<HerdrLaneResult>;
 	/** What the target's receiver answers. */
-	sendToTarget?: (
-		sessionId: string,
-		request: ChannelRequest,
-		options: { timeoutMs?: number },
-	) => Promise<ChannelResponse>;
+	sendToTarget?: (request: ChannelRequest, options: { timeoutMs?: number }) => Promise<ChannelResponse>;
 	/** The session id recorded in a session file's header. */
 	sessionHeaderIds?: Record<string, string>;
 }
@@ -76,9 +72,9 @@ export function makeFakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
 		ownRecords: async () =>
 			options.ownRecords ?? { modelChangeEntryId: "own-record-1", thinkingLevelEntryId: "own-record-2" },
 		readSessionHeaderId: async (sessionPath) => options.sessionHeaderIds?.[sessionPath] ?? null,
-		sendToTarget: async (sessionId, request) => {
-			calls.deliveries.push({ sessionId, request });
-			if (options.sendToTarget) return options.sendToTarget(sessionId, request, { timeoutMs: 5000 });
+		sendToTarget: async (request) => {
+			calls.deliveries.push({ sessionId: request.sessionId, request });
+			if (options.sendToTarget) return options.sendToTarget(request, { timeoutMs: 5000 });
 			return {
 				ok: false,
 				refusal: { code: "receiver_unavailable", message: "no receiver is listening" },

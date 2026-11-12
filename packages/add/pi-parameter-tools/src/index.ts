@@ -158,12 +158,13 @@ export function createParameterRuntime(pi: ExtensionAPI, ctx: ExtensionContext):
 				readHerdrEnvironment(process.env as Record<string, string | undefined>),
 			),
 		readSessionHeaderId: async (sessionPath) => readSessionHeaderId(sessionPath),
-		sendToTarget: async (
-			sessionId: string,
-			request: ChannelRequest,
-			options: { timeoutMs?: number },
-		): Promise<ChannelResponse> => {
-			return await sendRequest({ sessionId, request, timeoutMs: options.timeoutMs });
+		sendToTarget: async (request: ChannelRequest, options: { timeoutMs?: number }): Promise<ChannelResponse> => {
+			return await sendRequest({
+				sessionId: request.sessionId,
+				sessionPath: request.sessionPath,
+				request,
+				timeoutMs: options.timeoutMs,
+			});
 		},
 	};
 }
@@ -199,17 +200,28 @@ export default function parameterTools(pi: ExtensionAPI) {
 	// The receiver: this session listens for requests from other lanes that want its
 	// model or its thinking level changed. It is started with the session and closed
 	// with it, and it changes only this session, with this session's own setters.
+	//
+	// The session's identity is the pair (id, file): a copied session file keeps the
+	// header's id, so the id alone does not name a session. The socket's path is
+	// derived from the pair, and the receiver owns that socket: it takes the name
+	// when it is the most recent owner of that session file, and its cleanup removes
+	// only its own socket, never the one another owner has taken over.
 	let receiver: Receiver | null = null;
 
 	pi.on("session_start", async (_event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId() ?? null;
-		if (!sessionId) return;
+		const sessionPath = ctx.sessionManager.getSessionFile() ?? null;
+		// The previous session's receiver goes with the previous session: pi emits
+		// `session_shutdown` for it, and a session that starts without a file has
+		// nothing another lane could name.
 		receiver?.close();
-		receiver = startReceiver({
-			socketPath: socketPathFor(sessionId),
+		receiver = null;
+		if (!sessionId || !sessionPath) return;
+		receiver = await startReceiver({
+			socketPath: socketPathFor(sessionId, sessionPath),
 			session: {
 				sessionId,
-				sessionPath: ctx.sessionManager.getSessionFile() ?? null,
+				sessionPath,
 				workspaceId: process.env.HERDR_WORKSPACE_ID ?? null,
 				tabId: process.env.HERDR_TAB_ID ?? null,
 				paneId: process.env.HERDR_PANE_ID ?? null,

@@ -8,6 +8,7 @@
 // These tests use a fake session: the setters are counted, not run.
 
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -186,14 +187,15 @@ describe("a request this session refuses", () => {
 describe("the receiver as a listener", () => {
 	test("it answers on its socket, and the socket goes when it closes", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ft55-receiver-"));
-		const socketPath = socketPathFor(ID, dir);
+		const socketPath = socketPathFor(ID, PATH, dir);
 		const session = fakeSession();
-		const receiver = startReceiver({ socketPath, session });
+		const receiver = await startReceiver({ socketPath, session });
 		try {
-			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(receiver.listening).toBe(true);
 			expect(existsSync(socketPath)).toBe(true);
 			const response = await sendRequest({
 				sessionId: ID,
+				sessionPath: PATH,
 				request: request(),
 				dir: dir,
 				timeoutMs: 2000,
@@ -207,5 +209,142 @@ describe("the receiver as a listener", () => {
 			expect(existsSync(socketPath)).toBe(false);
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("who owns the socket", () => {
+	test("the newest owner takes the name, and the old owner cannot take it back", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ft55-receiver-"));
+		const socketPath = socketPathFor(ID, PATH, dir);
+		const first = fakeSession();
+		const second = fakeSession();
+		const notices: string[] = [];
+		const owner = await startReceiver({ socketPath, session: first });
+		const newcomer = await startReceiver({
+			socketPath,
+			session: second,
+			onError: (message) => notices.push(message),
+		});
+		try {
+			expect(owner.listening).toBe(true);
+			expect(newcomer.listening).toBe(true);
+			expect(notices.join(" ")).toContain("took");
+
+			// The name belongs to the newest owner: the request lands there.
+			const response = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request(),
+				dir,
+				timeoutMs: 2000,
+			});
+			expect(response.ok).toBe(true);
+			expect(second.calls.setThinkingLevel).toEqual(["high"]);
+			expect(first.calls.setThinkingLevel).toEqual([]);
+
+			// The previous owner shuts down. Its cleanup must not take the name
+			// away from the owner that has it now.
+			owner.close();
+			expect(existsSync(socketPath)).toBe(true);
+			const after = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request({ level: "medium" }),
+				dir,
+				timeoutMs: 2000,
+			});
+			expect(after.ok).toBe(true);
+			expect(second.calls.setThinkingLevel).toEqual(["high", "medium"]);
+			expect(first.calls.setThinkingLevel).toEqual([]);
+		} finally {
+			owner.close();
+			newcomer.close();
+			expect(existsSync(socketPath)).toBe(false);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a socket left behind by a process that died is replaced", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ft55-receiver-"));
+		const socketPath = socketPathFor(ID, PATH, dir);
+		// A process that binds the socket and is killed leaves the file behind with
+		// nobody listening: exactly what a crashed lane leaves.
+		const child = spawn(
+			process.execPath,
+			[
+				"-e",
+				'const s = require("node:net").createServer(); s.listen(process.env.FT55_SOCKET, () => process.send("ready"));',
+			],
+			{ stdio: ["ignore", "ignore", "ignore", "ipc"], env: { ...process.env, FT55_SOCKET: socketPath } },
+		);
+		await new Promise<void>((resolve, reject) => {
+			child.once("message", () => resolve());
+			child.once("error", reject);
+		});
+		child.kill("SIGKILL");
+		await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+		expect(existsSync(socketPath)).toBe(true);
+
+		const notices: string[] = [];
+		const receiver = await startReceiver({
+			socketPath,
+			session: fakeSession(),
+			onError: (message) => notices.push(message),
+		});
+		try {
+			expect(receiver.listening).toBe(true);
+			expect(notices.join(" ")).toContain("replaced");
+			const response = await sendRequest({
+				sessionId: ID,
+				sessionPath: PATH,
+				request: request(),
+				dir,
+				timeoutMs: 2000,
+			});
+			expect(response.ok).toBe(true);
+		} finally {
+			receiver.close();
+			expect(existsSync(socketPath)).toBe(false);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a request in flight is answered when the receiver closes", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ft55-receiver-"));
+		const socketPath = socketPathFor(ID, PATH, dir);
+		let markEntered: () => void = () => {};
+		const entered = new Promise<void>((resolve) => {
+			markEntered = resolve;
+		});
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		// The session's own setter holds the request open: the request is in flight.
+		const session = fakeSession();
+		const setModel = session.setModel;
+		session.setModel = async (ref) => {
+			markEntered();
+			await gate;
+			return await setModel(ref);
+		};
+		const receiver = await startReceiver({ socketPath, session });
+		const pending = sendRequest({
+			sessionId: ID,
+			sessionPath: PATH,
+			request: request({ action: "set_model", provider: "anthropic", modelId: "claude-sonnet-4" }),
+			dir,
+			timeoutMs: 5000,
+		});
+		await entered;
+		receiver.close();
+		release();
+		release();
+		// The caller gets its answer rather than a hang: closing stops new
+		// connections, it does not cut off the one that is already running.
+		const response = await pending;
+		expect(response.ok).toBe(true);
+		expect((response.result as { applied?: string } | undefined)?.applied).toBe("model");
+		rmSync(dir, { recursive: true, force: true });
 	});
 });

@@ -59,6 +59,10 @@ export interface RpcSession {
 	getCommands(): Promise<RpcOutcome>;
 	setModel(provider: string, modelId: string): Promise<RpcOutcome>;
 	setThinkingLevel(level: string): Promise<RpcOutcome>;
+	/** Start a new session in this process: what /new does. */
+	newSession(): Promise<RpcOutcome>;
+	/** Switch to another session file: what /resume does. */
+	switchSession(sessionPath: string): Promise<RpcOutcome>;
 	/** Send a prompt. A prompt that is a slash command runs the command, not the model. */
 	prompt(message: string): Promise<RpcOutcome>;
 	close(): Promise<void>;
@@ -214,6 +218,12 @@ export async function openRpcSession(options: RpcOptions): Promise<RpcSession> {
 		},
 		async setThinkingLevel(level: string): Promise<RpcOutcome> {
 			return send({ type: "set_thinking_level", level });
+		},
+		async newSession(): Promise<RpcOutcome> {
+			return send({ type: "new_session" });
+		},
+		async switchSession(sessionPath: string): Promise<RpcOutcome> {
+			return send({ type: "switch_session", sessionPath });
 		},
 		async prompt(message: string): Promise<RpcOutcome> {
 			return send({ type: "prompt", message });
