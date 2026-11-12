@@ -191,9 +191,9 @@ bun test             # the tests alone
 ```
 
 The unit tests drive injected collaborators — no process, no provider, no network. They
-cover the channel (where the socket is, what the request carries, and what the caller is
-told when the other end is gone, busy, or speaks nonsense) and the receiver (what it
-applies, and what it refuses).
+cover the channel (where the socket is, what the request carries, what the caller is
+told when the other end is gone, busy, or speaks nonsense, and **which** session a
+request reaches) and the receiver (what it applies, and what it refuses).
 
 The integration test opens **real disposable pi sessions** in a temporary directory, each
 with this extension loaded, so each one runs its own receiver. The caller is a real pi as
@@ -203,6 +203,28 @@ command runs in-process, so no provider is called. The test then checks the prop
 matters: a change aimed at one session changes that session and leaves the caller's and
 the unrelated session's state and files untouched — and a change that cannot be made is
 refused, with nothing written anywhere.
+
+**The fixture is hermetic, and it has to be.** Each child pi gets its own home, its own
+pi configuration directory (`PI_CODING_AGENT_DIR`), its own session store and its own
+runtime directory, and it inherits nothing but `PATH` from the test process: no operator
+settings, no operator model catalog, no ambient credential. The configuration holds one
+**fake** provider with two fake models and a literal key that is not a credential, and the
+provider's base url points at a local server that records every request.
+
+That is not decoration. A fixture that inherits the machine's configuration inherits the
+machine's *baseline*: pi maps a session's saved thinking level through the current
+model's thinking-level map, so a session that saved `off` starts at whatever level that
+model supports — `low` on one machine, `off` on another. The test then asserts a value
+it does not control. With the isolated configuration the model is the fixture's, the
+baseline is the fixture's, and the assertion is about the fixture.
+
+It also means **a real model change can be proven without a live credential and without
+a provider call**. pi's own `setModel` refuses a provider it has no credential for, but
+the credential check is a *local* one: a provider configured with a literal key counts as
+configured, and selecting a model is not a completion. So the model change in the test is
+a real change, made by the target's own process, recorded in the target's own session
+file — with a key that is not a key, and with a base url that was never called. The test
+asserts that the base url received no request at all.
 
 ## Install
 
