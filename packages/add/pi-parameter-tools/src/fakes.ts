@@ -3,6 +3,7 @@
 // The runtime and the herdr command are injected, so every path in this package can
 // be exercised without a process, a provider or a network.
 
+import type { ChannelRequest, ChannelResponse } from "./channel.ts";
 import type { HerdrLaneResult } from "./herdr.ts";
 import type { ModelRef } from "./params.ts";
 import type { ParameterRuntime } from "./target.ts";
@@ -17,6 +18,12 @@ export interface FakeRuntimeOptions {
 	authed?: boolean;
 	ownRecords?: { modelChangeEntryId: string | null; thinkingLevelEntryId: string | null };
 	resolveLane?: (lane: string) => Promise<HerdrLaneResult>;
+	/** What the target's receiver answers. */
+	sendToTarget?: (
+		sessionId: string,
+		request: ChannelRequest,
+		options: { timeoutMs?: number },
+	) => Promise<ChannelResponse>;
 	/** The session id recorded in a session file's header. */
 	sessionHeaderIds?: Record<string, string>;
 }
@@ -26,6 +33,7 @@ export interface FakeRuntime extends ParameterRuntime {
 		setModel: ModelRef[];
 		setThinkingLevel: string[];
 		laneResolutions: string[];
+		deliveries: { sessionId: string; request: ChannelRequest }[];
 	};
 	state: { model: ModelRef | null; thinkingLevel: string | null };
 }
@@ -39,6 +47,7 @@ export function makeFakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
 		setModel: [] as ModelRef[],
 		setThinkingLevel: [] as string[],
 		laneResolutions: [] as string[],
+		deliveries: [] as { sessionId: string; request: ChannelRequest }[],
 	};
 	const known = options.knownModels ?? [{ provider: "anthropic", modelId: "claude-sonnet-4" }];
 	return {
@@ -67,6 +76,14 @@ export function makeFakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
 		ownRecords: async () =>
 			options.ownRecords ?? { modelChangeEntryId: "own-record-1", thinkingLevelEntryId: "own-record-2" },
 		readSessionHeaderId: async (sessionPath) => options.sessionHeaderIds?.[sessionPath] ?? null,
+		sendToTarget: async (sessionId, request) => {
+			calls.deliveries.push({ sessionId, request });
+			if (options.sendToTarget) return options.sendToTarget(sessionId, request, { timeoutMs: 5000 });
+			return {
+				ok: false,
+				refusal: { code: "receiver_unavailable", message: "no receiver is listening" },
+			};
+		},
 		resolveLane: async (lane) => {
 			calls.laneResolutions.push(lane);
 			if (options.resolveLane) return options.resolveLane(lane);

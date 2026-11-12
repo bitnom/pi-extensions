@@ -5,12 +5,13 @@
 //
 //   * the **own** session — the caller's own session, changed in the caller's own
 //     process through pi's own session-control methods;
-//   * a **target session** — an explicitly identified session, reached over pi's own
-//     RPC control channel.
+//   * a **target session** — an explicitly identified session, reached over the local
+//     channel to the receiver in the process that owns it.
 //
 // The runtime is injected, so every path in this file can be exercised without a
 // process (the unit tests) and against a real disposable pi (the integration test).
 
+import type { ChannelRequest, ChannelResponse } from "./channel.ts";
 import type { HerdrLaneResult } from "./herdr.ts";
 import { isHeldPlace } from "./holds.ts";
 import { isOwnSession, type ResolvedBinding, resolveBinding, type TargetRequest } from "./identity.ts";
@@ -25,28 +26,8 @@ import {
 	type TargetReport,
 } from "./params.ts";
 
-/**
- * Why a session this package cannot reach is refused.
- *
- * pi 1.5.0 exposes session control to the process that owns the session: the
- * ExtensionAPI's `setModel` / `setThinkingLevel`, and the RPC mode's `set_model` /
- * `set_thinking_level` — and the RPC channel belongs to the **parent** of an
- * RPC-mode child, over that child's stdin. There is no attach path, no socket, no
- * listener and no cross-process session control in pi.
- *
- * So a session running in another process cannot be changed from here. This is the
- * capability that is missing, and it is reported as a capability, not as a policy:
- * the target is named and identified, and the refusal says what would be needed.
- */
-export const CAPABILITY_MISSING =
-	"that session runs in another process, and pi exposes no supported channel to it: " +
-	"session control (setModel, setThinkingLevel) is available only to the process that " +
-	"owns the session, and the RPC channel belongs to the parent of an RPC-mode child";
-
-/** What the caller would have to build for the cross-session case to work. */
-export const CAPABILITY_RECEIVER =
-	"an in-process receiver in the target lane (the same package, loaded there, applying " +
-	"the change with its own session-control methods) plus a delivery channel to it";
+/** How long the caller waits for the target's receiver to answer. */
+const TARGET_TIMEOUT_MS = 5000;
 
 /** What the caller can do to its own session. */
 export interface ParameterRuntime {
@@ -72,6 +53,13 @@ export interface ParameterRuntime {
 	resolveLane(lane: string): Promise<HerdrLaneResult>;
 	/** The session id recorded in a session file's header, or null when there is none. */
 	readSessionHeaderId(sessionPath: string): Promise<string | null>;
+	/**
+	 * Deliver a request to the target session's receiver and wait for its answer.
+	 *
+	 * Injected so the unit tests can drive the protocol without a socket, and so the
+	 * integration test can deliver to a real running pi.
+	 */
+	sendToTarget(sessionId: string, request: ChannelRequest, options: { timeoutMs?: number }): Promise<ChannelResponse>;
 }
 
 export interface SessionRequest extends TargetRequest {
@@ -399,9 +387,13 @@ export async function applySessionThinking(
 		};
 	}
 
-	// Another session. Its parameters live in the process that owns it, and pi
-	// exposes no channel from here into that process. Say so, and change nothing.
-	return unreachableTarget(tool, target, binding.sessionId, sessionPath);
+	// Another session. Its parameters live in the process that owns it, so the
+	// request goes to that process's receiver, and that process applies the change
+	// with its own setters.
+	return deliverToTarget(runtime, tool, target, binding.sessionId, sessionPath, {
+		action: "set_thinking",
+		level: level as string,
+	});
 }
 
 export async function applySessionModel(
@@ -440,27 +432,54 @@ export async function applySessionModel(
 		return { ...own, target };
 	}
 
-	return unreachableTarget(tool, target, binding.sessionId, sessionPath);
+	return deliverToTarget(runtime, tool, target, binding.sessionId, sessionPath, {
+		action: "set_model",
+		provider: ref.provider,
+		modelId: ref.modelId,
+	});
 }
 
 /**
- * The refusal for a session that runs in another process.
+ * Deliver a request to the target session's receiver and report what it answered.
  *
- * It names the session that was identified, the session file it lives in, and the
- * capability that is missing — so the caller learns what would have to be built, and
- * the refusal is not mistaken for a policy decision.
+ * The receiver is the target's own process: it applies the change with its own
+ * session-control methods, and it answers with the state it observed there. The
+ * caller's report is therefore the target's own result, not the caller's guess.
  */
-function unreachableTarget(
+async function deliverToTarget(
+	runtime: ParameterRuntime,
 	tool: string,
 	target: TargetReport,
 	sessionId: string,
 	sessionPath: string,
-): ParameterToolResult {
-	return refusal(tool, "target_not_reachable", CAPABILITY_MISSING, target, {
-		capability: "cross_process_session_control",
-		requires: CAPABILITY_RECEIVER,
-		targetSessionId: sessionId,
-		targetSessionPath: sessionPath,
-		changed: false,
-	});
+	action: { action: "set_thinking" | "set_model"; level?: string; provider?: string; modelId?: string },
+): Promise<ParameterToolResult> {
+	const request: ChannelRequest = {
+		requestId: `${tool}-${Date.now().toString(36)}`,
+		tool,
+		sessionId,
+		sessionPath,
+		...action,
+	};
+	let response: ChannelResponse;
+	try {
+		response = await runtime.sendToTarget(sessionId, request, { timeoutMs: TARGET_TIMEOUT_MS });
+	} catch (error) {
+		return refusal(tool, "target_unreachable", "the target session could not be reached", target, {
+			cause: error instanceof Error ? error.message : "unknown",
+		});
+	}
+	if (!response.ok) {
+		const refusalCode = (response.refusal?.code ?? "target_unreachable") as RefusalCode;
+		return refusal(tool, refusalCode, response.refusal?.message ?? "the target session refused the request", target, {
+			...(response.refusal?.detail ?? {}),
+			receiver: response.receiver,
+		});
+	}
+	const result = (response.result ?? {}) as unknown as ParameterToolResult;
+	return {
+		...result,
+		tool,
+		target: { ...target, resolution: { source: "receiver" } },
+	};
 }

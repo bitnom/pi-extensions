@@ -10,11 +10,15 @@
 // so the tests can drive the whole protocol without a process, and the integration
 // test can drive and observe a real disposable pi.
 //
-// It is **not** a mutation path of this package. A second process opened on somebody
-// else's session file is not that session's process, and writing to a session file that
-// a running lane owns makes two writers of one session. The client is here because it
-// is how a real pi is driven and observed, and because it is the shape an in-process
-// receiver would use.
+// It is **not** the path by which this package changes another lane's session. A
+// second process opened on somebody else's session file is not that session's process,
+// and writing to a session file that a running lane owns makes two writers of one
+// session. The client is here because it is how a pi is driven and observed — the
+// caller's own session, and the disposable sessions of the tests — and because the
+// receiver is the in-process half of the same shape.
+//
+// A **running** lane's session is never opened by a second process. The change goes to
+// that lane's own process, over the receiver's local socket.
 
 /** The subset of a child process this module uses. A fake satisfies it in tests. */
 export interface RpcChild {
@@ -25,7 +29,11 @@ export interface RpcChild {
 	kill(signal?: string): unknown;
 }
 
-export type SpawnFn = (command: string, args: string[], options: { stdio: ["pipe", "pipe", "pipe"] }) => RpcChild;
+export type SpawnFn = (
+	command: string,
+	args: string[],
+	options: { stdio: ["pipe", "pipe", "pipe"]; env?: Record<string, string> },
+) => RpcChild;
 
 /** The state pi reports about its session. */
 export interface RpcState {
@@ -47,8 +55,12 @@ export interface RpcSession {
 	getState(): Promise<RpcOutcome>;
 	getEntries(): Promise<RpcOutcome>;
 	getAvailableModels(): Promise<RpcOutcome>;
+	/** The commands the session's extensions registered. */
+	getCommands(): Promise<RpcOutcome>;
 	setModel(provider: string, modelId: string): Promise<RpcOutcome>;
 	setThinkingLevel(level: string): Promise<RpcOutcome>;
+	/** Send a prompt. A prompt that is a slash command runs the command, not the model. */
+	prompt(message: string): Promise<RpcOutcome>;
 	close(): Promise<void>;
 }
 
@@ -93,6 +105,7 @@ export async function openRpcSession(options: RpcOptions): Promise<RpcSession> {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const child = options.spawn(command, ["--mode", "rpc", "--session", options.sessionPath], {
 		stdio: ["pipe", "pipe", "pipe"],
+		env: options.env,
 	});
 
 	let nextId = 0;
@@ -193,11 +206,17 @@ export async function openRpcSession(options: RpcOptions): Promise<RpcSession> {
 		async getAvailableModels(): Promise<RpcOutcome> {
 			return send({ type: "get_available_models" });
 		},
+		async getCommands(): Promise<RpcOutcome> {
+			return send({ type: "get_commands" });
+		},
 		async setModel(provider: string, modelId: string): Promise<RpcOutcome> {
 			return send({ type: "set_model", provider, modelId });
 		},
 		async setThinkingLevel(level: string): Promise<RpcOutcome> {
 			return send({ type: "set_thinking_level", level });
+		},
+		async prompt(message: string): Promise<RpcOutcome> {
+			return send({ type: "prompt", message });
 		},
 		async close(): Promise<void> {
 			try {

@@ -12,21 +12,28 @@
 //
 // The session-targeted tools name their target explicitly: a session id **and** one
 // unambiguous binding (a session path or a herdr lane). A session id alone is never
-// enough, because ids can repeat across session files. The target is reached over
-// pi's own RPC control channel — the documented way to drive a session's parameters
-// from outside that session's process — and the target is asked which session it is
-// before anything is changed.
+// enough, because ids can repeat across session files.
+//
+// The target is reached through a **receiver** inside the target's own pi process.
+// pi exposes no cross-process session control, so this package brings its own: the
+// target's extension listens on a local socket (the receiver), the caller sends the
+// request there, and the target's process applies the change with **its own** pi
+// setters and answers with the state it observed there. The target session is
+// therefore written by the process that owns it, and by nobody else.
 //
 // What this package does NOT do: write a session file by hand, type into another
-// pane's terminal, relay a slash command, edit settings, or restart anything. The
-// change is made by pi's own setter, in a pi process, for one named session.
+// pane's terminal, relay a slash command, edit settings, restart anything, or start
+// a second pi process to change a session that is already running. The change is made
+// by pi's own setter, in a pi process, for one named session.
 
 import { getSupportedThinkingLevels, type JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { type ChannelRequest, type ChannelResponse, sendRequest, socketPathFor } from "./channel.ts";
 import { readHerdrEnvironment, resolveLaneSession } from "./herdr.ts";
 import { isHeldPlace } from "./holds.ts";
 import { emptyTarget, type ModelRef, type ParameterToolResult, refusal, summarise, THINKING_LEVELS } from "./params.ts";
+import { type Receiver, startReceiver } from "./receiver.ts";
 import { readSessionHeaderId } from "./session-file.ts";
 import {
 	applyOwnModel,
@@ -107,8 +114,13 @@ function ownRecords(ctx: ExtensionContext): {
 	return out;
 }
 
-/** The runtime the tools work against: the caller's own session, plus the reach. */
-function makeRuntime(pi: ExtensionAPI, ctx: ExtensionContext): ParameterRuntime {
+/**
+ * The runtime the tools work against: the caller's own session, plus the reach.
+ *
+ * It is exported so that a host (or a test) can drive the same path the tools
+ * drive, against a real extension context, rather than a stand-in.
+ */
+export function createParameterRuntime(pi: ExtensionAPI, ctx: ExtensionContext): ParameterRuntime {
 	return {
 		own: {
 			sessionId: ctx.sessionManager.getSessionId() ?? null,
@@ -146,6 +158,13 @@ function makeRuntime(pi: ExtensionAPI, ctx: ExtensionContext): ParameterRuntime 
 				readHerdrEnvironment(process.env as Record<string, string | undefined>),
 			),
 		readSessionHeaderId: async (sessionPath) => readSessionHeaderId(sessionPath),
+		sendToTarget: async (
+			sessionId: string,
+			request: ChannelRequest,
+			options: { timeoutMs?: number },
+		): Promise<ChannelResponse> => {
+			return await sendRequest({ sessionId, request, timeoutMs: options.timeoutMs });
+		},
 	};
 }
 
@@ -177,6 +196,52 @@ function heldRefusal(tool: string): ParameterToolResult | null {
 }
 
 export default function parameterTools(pi: ExtensionAPI) {
+	// The receiver: this session listens for requests from other lanes that want its
+	// model or its thinking level changed. It is started with the session and closed
+	// with it, and it changes only this session, with this session's own setters.
+	let receiver: Receiver | null = null;
+
+	pi.on("session_start", async (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId() ?? null;
+		if (!sessionId) return;
+		receiver?.close();
+		receiver = startReceiver({
+			socketPath: socketPathFor(sessionId),
+			session: {
+				sessionId,
+				sessionPath: ctx.sessionManager.getSessionFile() ?? null,
+				workspaceId: process.env.HERDR_WORKSPACE_ID ?? null,
+				tabId: process.env.HERDR_TAB_ID ?? null,
+				paneId: process.env.HERDR_PANE_ID ?? null,
+				supportedThinkingLevels: () => {
+					const model = ctx.model;
+					if (!model) return [...THINKING_LEVELS];
+					return getSupportedThinkingLevels(model);
+				},
+				resolveModel: (ref) => {
+					const found = ctx.modelRegistry.find(ref.provider, ref.modelId);
+					return found ? { provider: found.provider, modelId: found.id } : null;
+				},
+				setThinkingLevel: (level) => {
+					pi.setThinkingLevel(level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
+				},
+				setModel: async (ref) => {
+					const found = ctx.modelRegistry.find(ref.provider, ref.modelId);
+					if (!found) return false;
+					return pi.setModel(found);
+				},
+				thinkingLevel: () => pi.getThinkingLevel() ?? null,
+				model: () => modelRef(ctx.model),
+				records: () => ownRecords(ctx),
+			},
+		});
+	});
+
+	pi.on("session_shutdown", async () => {
+		receiver?.close();
+		receiver = null;
+	});
+
 	pi.registerTool({
 		name: "set_own_thinking",
 		label: "Set Own Thinking",
@@ -196,7 +261,7 @@ export default function parameterTools(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const held = heldRefusal("set_own_thinking");
 			if (held) return toolResult(held);
-			return toolResult(await applyOwnThinking(makeRuntime(pi, ctx), "set_own_thinking", params.level));
+			return toolResult(await applyOwnThinking(createParameterRuntime(pi, ctx), "set_own_thinking", params.level));
 		},
 	});
 
@@ -220,7 +285,9 @@ export default function parameterTools(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const held = heldRefusal("set_own_model");
 			if (held) return toolResult(held);
-			return toolResult(await applyOwnModel(makeRuntime(pi, ctx), "set_own_model", params.provider, params.modelId));
+			return toolResult(
+				await applyOwnModel(createParameterRuntime(pi, ctx), "set_own_model", params.provider, params.modelId),
+			);
 		},
 	});
 
@@ -228,11 +295,11 @@ export default function parameterTools(pi: ExtensionAPI) {
 		name: "set_session_thinking",
 		label: "Set Session Thinking",
 		description:
-			"Set the thinking/reasoning effort of an explicitly identified pi session. Name the session id and one unambiguous binding: a session file path OR a herdr lane. The named session's own file must hold that session id. A session running in another process is refused (target_not_reachable): pi exposes no channel to it, and nothing is changed.",
+			"Set the thinking/reasoning effort of an explicitly identified pi session. Name the session id and one unambiguous binding: a session file path OR a herdr lane. The named session's own file must hold that session id. The request goes to the target's own running pi process, which applies the change with its own setters and answers with what it observed. A target that is not running, or that has no receiver loaded, is refused (receiver_unavailable) and nothing is changed.",
 		promptSnippet: "Set another pi session's thinking/reasoning effort by explicit target",
 		promptGuidelines: [
 			"Give both a sessionId and exactly one of sessionPath or lane; a session id alone is refused as ambiguous.",
-			"A refusal names the reason (identity_binding_required, session_id_mismatch, held_lane, target_lane_unknown, target_not_reachable, ...); nothing is changed on a refusal.",
+			"A refusal names the reason (identity_binding_required, session_id_mismatch, held_lane, receiver_unavailable, target_timeout, ...); nothing is changed on a refusal.",
 		],
 		parameters: Type.Object({
 			...TARGET_PARAMETERS,
@@ -246,7 +313,7 @@ export default function parameterTools(pi: ExtensionAPI) {
 			if (held) return toolResult(held);
 			return toolResult(
 				await applySessionThinking(
-					makeRuntime(pi, ctx),
+					createParameterRuntime(pi, ctx),
 					"set_session_thinking",
 					{ sessionId: params.sessionId, sessionPath: params.sessionPath, lane: params.lane },
 					params.level,
@@ -259,7 +326,7 @@ export default function parameterTools(pi: ExtensionAPI) {
 		name: "set_session_model",
 		label: "Set Session Model",
 		description:
-			"Set the provider/model of an explicitly identified pi session. Name the session id and one unambiguous binding: a session file path OR a herdr lane. The named session's own file must hold that session id. A session running in another process is refused (target_not_reachable): pi exposes no channel to it, and nothing is changed.",
+			"Set the provider/model of an explicitly identified pi session. Name the session id and one unambiguous binding: a session file path OR a herdr lane. The named session's own file must hold that session id. The request goes to the target's own running pi process, which applies the change with its own setters and answers with what it observed. A target that is not running, or that has no receiver loaded, is refused (receiver_unavailable) and nothing is changed.",
 		promptSnippet: "Set another pi session's provider and model by explicit target",
 		promptGuidelines: [
 			"Give both a sessionId and exactly one of sessionPath or lane; a session id alone is refused as ambiguous.",
@@ -278,7 +345,7 @@ export default function parameterTools(pi: ExtensionAPI) {
 			if (held) return toolResult(held);
 			return toolResult(
 				await applySessionModel(
-					makeRuntime(pi, ctx),
+					createParameterRuntime(pi, ctx),
 					"set_session_model",
 					{ sessionId: params.sessionId, sessionPath: params.sessionPath, lane: params.lane },
 					params.provider,

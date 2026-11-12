@@ -57,7 +57,10 @@ export type RefusalCode =
 	| "no_session_file"
 	| "session_id_mismatch"
 	| "session_identity_mismatch"
-	| "target_not_reachable"
+	| "target_timeout"
+	| "receiver_unavailable"
+	| "target_unreachable"
+	| "target_protocol_error"
 	| "held_lane"
 	| "target_session_unresolvable"
 	| "target_lane_unknown"
@@ -90,7 +93,7 @@ export interface TargetReport {
 	};
 	/** How the target was reached. */
 	resolution: {
-		source: "in_memory" | "session_file" | "lane";
+		source: "in_memory" | "session_file" | "lane" | "receiver";
 		lane?: string;
 	} | null;
 }
