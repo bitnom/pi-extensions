@@ -12,6 +12,7 @@
 // process (the unit tests) and against a real disposable pi (the integration test).
 
 import type { HerdrLaneResult } from "./herdr.ts";
+import { isHeldPlace } from "./holds.ts";
 import { isOwnSession, type ResolvedBinding, resolveBinding, type TargetRequest } from "./identity.ts";
 import {
 	type Applied,
@@ -23,7 +24,29 @@ import {
 	refusal,
 	type TargetReport,
 } from "./params.ts";
-import type { RpcOutcome, RpcSession } from "./rpc.ts";
+
+/**
+ * Why a session this package cannot reach is refused.
+ *
+ * pi 1.5.0 exposes session control to the process that owns the session: the
+ * ExtensionAPI's `setModel` / `setThinkingLevel`, and the RPC mode's `set_model` /
+ * `set_thinking_level` — and the RPC channel belongs to the **parent** of an
+ * RPC-mode child, over that child's stdin. There is no attach path, no socket, no
+ * listener and no cross-process session control in pi.
+ *
+ * So a session running in another process cannot be changed from here. This is the
+ * capability that is missing, and it is reported as a capability, not as a policy:
+ * the target is named and identified, and the refusal says what would be needed.
+ */
+export const CAPABILITY_MISSING =
+	"that session runs in another process, and pi exposes no supported channel to it: " +
+	"session control (setModel, setThinkingLevel) is available only to the process that " +
+	"owns the session, and the RPC channel belongs to the parent of an RPC-mode child";
+
+/** What the caller would have to build for the cross-session case to work. */
+export const CAPABILITY_RECEIVER =
+	"an in-process receiver in the target lane (the same package, loaded there, applying " +
+	"the change with its own session-control methods) plus a delivery channel to it";
 
 /** What the caller can do to its own session. */
 export interface ParameterRuntime {
@@ -33,22 +56,22 @@ export interface ParameterRuntime {
 		model: ModelRef | null;
 		thinkingLevel: string | null;
 	};
-	getModel(): ModelRef | null;
-	getThinkingLevel(): string | null;
+	getModel(): Promise<ModelRef | null>;
+	getThinkingLevel(): Promise<string | null>;
 	/** The thinking levels the current model supports. */
 	supportedThinkingLevels(): string[];
 	/** Resolve a provider/model pair in pi's model registry. Null when it is unknown. */
-	resolveModel(ref: ModelRef): ModelRef | null;
+	resolveModel(ref: ModelRef): Promise<ModelRef | null>;
 	/** Change the caller's own session's model. False when the provider has no auth. */
 	setOwnModel(ref: ModelRef): Promise<boolean>;
 	/** Change the caller's own session's thinking level. */
-	setOwnThinkingLevel(level: string): void;
+	setOwnThinkingLevel(level: string): Promise<void>;
 	/** The record ids the own session's branch gained, if any. */
-	ownRecords(): { modelChangeEntryId: string | null; thinkingLevelEntryId: string | null };
-	/** Open a session over pi's RPC control channel. */
-	openRemoteSession(sessionPath: string): Promise<RpcSession>;
+	ownRecords(): Promise<{ modelChangeEntryId: string | null; thinkingLevelEntryId: string | null }>;
 	/** Resolve a herdr lane to the session behind it. */
 	resolveLane(lane: string): Promise<HerdrLaneResult>;
+	/** The session id recorded in a session file's header, or null when there is none. */
+	readSessionHeaderId(sessionPath: string): Promise<string | null>;
 }
 
 export interface SessionRequest extends TargetRequest {
@@ -93,7 +116,7 @@ export async function applyOwnThinking(
 		return refusal(tool, "invalid_level", "that is not a thinking level pi accepts", emptyTarget(requested));
 	}
 	const supported = runtime.supportedThinkingLevels();
-	const before = runtime.getThinkingLevel();
+	const before = await runtime.getThinkingLevel();
 	const target: TargetReport = {
 		kind: "own",
 		sessionId: runtime.own.sessionId,
@@ -113,16 +136,20 @@ export async function applyOwnThinking(
 	}
 
 	const alreadyThere = before === level;
-	if (!alreadyThere) runtime.setOwnThinkingLevel(level);
-	const after = runtime.getThinkingLevel();
-	const records = runtime.ownRecords();
+	if (!alreadyThere) await runtime.setOwnThinkingLevel(level);
+	const after = await runtime.getThinkingLevel();
+	const records = await runtime.ownRecords();
 
 	const changed = !alreadyThere && after === level;
 	return {
 		ok: true,
 		tool,
 		target,
-		model: { before: modelRefOf(runtime.getModel()), requested: null, after: modelRefOf(runtime.getModel()) },
+		model: {
+			before: modelRefOf(await runtime.getModel()),
+			requested: null,
+			after: modelRefOf(await runtime.getModel()),
+		},
 		thinking: { before, requested: level, after, supported },
 		applied: changed ? "thinking" : "none",
 		changed,
@@ -163,14 +190,14 @@ export async function applyOwnModel(
 	if (!ref.provider || !ref.modelId) {
 		return refusal(tool, "invalid_identifier", "a model needs a provider and a model id", target);
 	}
-	const resolved = runtime.resolveModel(ref);
+	const resolved = await runtime.resolveModel(ref);
 	if (!resolved) {
 		return refusal(tool, "model_unknown", "that provider/model is not in the model registry", target, {
 			requested: ref,
 		});
 	}
-	const beforeModel = modelRefOf(runtime.getModel());
-	const beforeThinking = runtime.getThinkingLevel();
+	const beforeModel = modelRefOf(await runtime.getModel());
+	const beforeThinking = await runtime.getThinkingLevel();
 	if (sameModel(beforeModel, resolved)) {
 		return {
 			ok: true,
@@ -206,9 +233,9 @@ export async function applyOwnModel(
 			requested: resolved,
 		});
 	}
-	const afterModel = modelRefOf(runtime.getModel());
-	const afterThinking = runtime.getThinkingLevel();
-	const records = runtime.ownRecords();
+	const afterModel = modelRefOf(await runtime.getModel());
+	const afterThinking = await runtime.getThinkingLevel();
+	const records = await runtime.ownRecords();
 	const modelChanged = sameModel(afterModel, resolved);
 	const thinkingChanged = afterThinking !== beforeThinking;
 	const applied: Applied = modelChanged ? (thinkingChanged ? "both" : "model") : "none";
@@ -287,72 +314,45 @@ async function resolveTarget(
 		}
 		sessionPath = resolved.lane.sessionPath;
 		lane = binding.binding.lane;
+		// The fleet's holds: a lane in a held workspace or a reserved tab is not
+		// changed, whoever asks.
+		if (isHeldPlace({ paneId: resolved.lane.paneId })) {
+			return {
+				ok: false,
+				result: refusal(tool, "held_lane", "that lane is in a held or reserved place", emptyTarget(requested), {
+					held: true,
+					lane: binding.binding.lane,
+				}),
+			};
+		}
+	}
+
+	// The session file's own header names the session it holds. That is the last
+	// check before anything is changed: a file that holds a different session is not
+	// the session the request named, and the duplicate-id case is closed here.
+	const headerId = await runtime.readSessionHeaderId(sessionPath as string);
+	if (!headerId) {
+		return {
+			ok: false,
+			result: refusal(tool, "no_session_file", "that session file has no session id", emptyTarget(requested), {
+				sessionPath,
+			}),
+		};
+	}
+	if (headerId !== binding.binding.sessionId) {
+		return {
+			ok: false,
+			result: refusal(
+				tool,
+				"session_id_mismatch",
+				"that session file holds a different session than the one requested",
+				emptyTarget(requested),
+				{ sessionPath, requestedSessionId: binding.binding.sessionId, sessionFileId: headerId },
+			),
+		};
 	}
 
 	return { ok: true, target: { binding: binding.binding, sessionPath: sessionPath as string, lane } };
-}
-
-/**
- * The target's own answer to "which session are you?".
- *
- * A target that answers with a different session id, or a different file, is not the
- * target the request named: the request is refused and nothing is changed.
- */
-function identityMatches(
-	state: Record<string, unknown>,
-	binding: ResolvedBinding,
-	sessionPath: string,
-): { ok: true } | { ok: false; code: RefusalCode; message: string } {
-	const stateId = typeof state.sessionId === "string" ? state.sessionId : null;
-	if (!stateId) {
-		return { ok: false, code: "no_session_file", message: "that session has no session id" };
-	}
-	if (stateId !== binding.sessionId) {
-		return {
-			ok: false,
-			code: "session_id_mismatch",
-			message: "that session is not the session the request named",
-		};
-	}
-	const stateFile = typeof state.sessionFile === "string" ? state.sessionFile : null;
-	if (stateFile && stateFile !== sessionPath) {
-		return {
-			ok: false,
-			code: "session_identity_mismatch",
-			message: "that session file is not the session file the request named",
-		};
-	}
-	return { ok: true };
-}
-
-/** Read the record ids a target session gained, over the control channel. */
-function recordsFromEntries(data: unknown): {
-	modelChangeEntryId: string | null;
-	thinkingLevelEntryId: string | null;
-} {
-	const out = { modelChangeEntryId: null as string | null, thinkingLevelEntryId: null as string | null };
-	const entries = (data as { entries?: unknown })?.entries;
-	if (!Array.isArray(entries)) return out;
-	for (const entry of entries) {
-		if (!entry || typeof entry !== "object") continue;
-		const record = entry as { type?: unknown; id?: unknown };
-		if (typeof record.id !== "string") continue;
-		if (record.type === "model_change") out.modelChangeEntryId = record.id;
-		if (record.type === "thinking_level_change") out.thinkingLevelEntryId = record.id;
-	}
-	return out;
-}
-
-/** Classify an error pi reported for a command. */
-function classifyCommandError(error: string | undefined): { code: RefusalCode; message: string } {
-	const text = (error ?? "").toLowerCase();
-	if (text.includes("no api key") || text.includes("auth") || text.includes("oauth")) {
-		return { code: "auth_missing", message: "that provider has no configured credentials" };
-	}
-	if (text.includes("model not found")) {
-		return { code: "model_unknown", message: "that provider/model is not in the model registry" };
-	}
-	return { code: "apply_failed", message: "the change failed" };
 }
 
 /**
@@ -399,75 +399,11 @@ export async function applySessionThinking(
 		};
 	}
 
-	let session: RpcSession;
-	try {
-		session = await runtime.openRemoteSession(sessionPath);
-	} catch (error) {
-		return refusal(tool, "target_not_reachable", "the target session could not be reached", target, {
-			cause: error instanceof Error ? error.message : "unknown",
-		});
-	}
-	try {
-		const state = await session.getState();
-		if (!state.ok) {
-			const classified = classifyCommandError(state.error);
-			return refusal(tool, classified.code, classified.message, target);
-		}
-		const stateData = (state.data ?? {}) as Record<string, unknown>;
-		const identity = identityMatches(stateData, binding, sessionPath);
-		if (!identity.ok) {
-			return refusal(tool, identity.code, identity.message, target);
-		}
-		const beforeModel = modelRefOf(stateData.model);
-		const beforeThinking = typeof stateData.thinkingLevel === "string" ? stateData.thinkingLevel : null;
-		const alreadyThere = beforeThinking === level;
-
-		let outcome: RpcOutcome;
-		if (alreadyThere) {
-			outcome = { ok: true };
-		} else {
-			outcome = await session.setThinkingLevel(level);
-			if (!outcome.ok) {
-				const classified = classifyCommandError(outcome.error);
-				return refusal(tool, classified.code, classified.message, target);
-			}
-		}
-		const after = await session.getState();
-		const afterData = (after.ok ? (after.data ?? {}) : {}) as Record<string, unknown>;
-		const afterThinking = typeof afterData.thinkingLevel === "string" ? afterData.thinkingLevel : null;
-		const entries = await session.getEntries();
-		const records = entries.ok
-			? recordsFromEntries(entries.data)
-			: { modelChangeEntryId: null, thinkingLevelEntryId: null };
-		const changed = afterThinking === level && beforeThinking !== level;
-		const warnings = ["the target session's running process keeps its current parameters until it resumes"];
-		return {
-			ok: true,
-			tool,
-			target,
-			model: { before: beforeModel, requested: null, after: modelRefOf(afterData.model) },
-			thinking: { before: beforeThinking, requested: level, after: afterThinking, supported: [] },
-			applied: changed ? "thinking" : "none",
-			changed,
-			records,
-			disk: { state: "unknown" },
-			effective: "next_request",
-			partial: changed && !records.thinkingLevelEntryId,
-			warnings,
-		};
-	} finally {
-		await session.close();
-	}
+	// Another session. Its parameters live in the process that owns it, and pi
+	// exposes no channel from here into that process. Say so, and change nothing.
+	return unreachableTarget(tool, target, binding.sessionId, sessionPath);
 }
 
-/**
- * Set the model of an explicitly identified session.
- *
- * The same shape as the thinking variant: the target is identified first, asked who
- * it is, and only then changed. The model is resolved in the **target's** registry —
- * the control channel runs in the target's process, so the target decides whether it
- * knows the model.
- */
 export async function applySessionModel(
 	runtime: ParameterRuntime,
 	tool: string,
@@ -504,68 +440,27 @@ export async function applySessionModel(
 		return { ...own, target };
 	}
 
-	let session: RpcSession;
-	try {
-		session = await runtime.openRemoteSession(sessionPath);
-	} catch (error) {
-		return refusal(tool, "target_not_reachable", "the target session could not be reached", target, {
-			cause: error instanceof Error ? error.message : "unknown",
-		});
-	}
-	try {
-		const state = await session.getState();
-		if (!state.ok) {
-			const classified = classifyCommandError(state.error);
-			return refusal(tool, classified.code, classified.message, target);
-		}
-		const stateData = (state.data ?? {}) as Record<string, unknown>;
-		const identity = identityMatches(stateData, binding, sessionPath);
-		if (!identity.ok) {
-			return refusal(tool, identity.code, identity.message, target);
-		}
-		const beforeModel = modelRefOf(stateData.model);
-		const beforeThinking = typeof stateData.thinkingLevel === "string" ? stateData.thinkingLevel : null;
-		const alreadyThere = sameModel(beforeModel, ref);
+	return unreachableTarget(tool, target, binding.sessionId, sessionPath);
+}
 
-		let outcome: RpcOutcome;
-		if (alreadyThere) {
-			outcome = { ok: true };
-		} else {
-			outcome = await session.setModel(ref.provider, ref.modelId);
-			if (!outcome.ok) {
-				const classified = classifyCommandError(outcome.error);
-				return refusal(tool, classified.code, classified.message, target);
-			}
-		}
-		const after = await session.getState();
-		const afterData = (after.ok ? (after.data ?? {}) : {}) as Record<string, unknown>;
-		const entries = await session.getEntries();
-		const records = entries.ok
-			? recordsFromEntries(entries.data)
-			: { modelChangeEntryId: null, thinkingLevelEntryId: null };
-		const afterModel = modelRefOf(afterData.model);
-		const changed = sameModel(afterModel, ref) && !sameModel(beforeModel, ref);
-		const warnings = ["the target session's running process keeps its current parameters until it resumes"];
-		return {
-			ok: true,
-			tool,
-			target,
-			model: { before: beforeModel, requested: ref, after: afterModel },
-			thinking: {
-				before: beforeThinking,
-				requested: null,
-				after: typeof afterData.thinkingLevel === "string" ? afterData.thinkingLevel : null,
-				supported: [],
-			},
-			applied: changed ? "model" : "none",
-			changed,
-			records,
-			disk: { state: "unknown" },
-			effective: "next_request",
-			partial: changed && !records.modelChangeEntryId,
-			warnings,
-		};
-	} finally {
-		await session.close();
-	}
+/**
+ * The refusal for a session that runs in another process.
+ *
+ * It names the session that was identified, the session file it lives in, and the
+ * capability that is missing — so the caller learns what would have to be built, and
+ * the refusal is not mistaken for a policy decision.
+ */
+function unreachableTarget(
+	tool: string,
+	target: TargetReport,
+	sessionId: string,
+	sessionPath: string,
+): ParameterToolResult {
+	return refusal(tool, "target_not_reachable", CAPABILITY_MISSING, target, {
+		capability: "cross_process_session_control",
+		requires: CAPABILITY_RECEIVER,
+		targetSessionId: sessionId,
+		targetSessionPath: sessionPath,
+		changed: false,
+	});
 }

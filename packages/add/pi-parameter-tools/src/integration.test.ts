@@ -13,7 +13,8 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openRpcSession, type RpcChild } from "./rpc.ts";
+import { openRpcSession, type RpcChild, type RpcSession } from "./rpc.ts";
+import { readSessionHeaderId } from "./session-file.ts";
 import { applySessionModel, applySessionThinking, type ParameterRuntime } from "./target.ts";
 
 /** A disposable session: a header, a model, a level, and one message so pi persists it. */
@@ -57,24 +58,9 @@ let sessionA = "";
 let sessionB = "";
 let idA = "";
 let idB = "";
+let channelA: RpcSession | null = null;
 
-const runtime: ParameterRuntime = {
-	own: { sessionId: "caller-session", sessionPath: null, model: null, thinkingLevel: null },
-	getModel: () => null,
-	getThinkingLevel: () => null,
-	supportedThinkingLevels: () => ["off", "low", "medium", "high"],
-	resolveModel: () => null,
-	setOwnModel: async () => false,
-	setOwnThinkingLevel: () => {},
-	ownRecords: () => ({ modelChangeEntryId: null, thinkingLevelEntryId: null }),
-	openRemoteSession: (sessionPath) => openRpcSession({ spawn: spawnPi, sessionPath, timeoutMs: 30_000 }),
-	resolveLane: async () => ({
-		ok: false,
-		failure: { code: "herdr_absent", message: "herdr is not available in this environment" },
-	}),
-};
-
-/** Read a session's own answer about itself, over the same channel the tool uses. */
+/** Read a session's own answer about itself, over pi's control channel. */
 async function askSession(sessionPath: string): Promise<Record<string, unknown>> {
 	const session = await openRpcSession({ spawn: spawnPi, sessionPath, timeoutMs: 30_000 });
 	try {
@@ -94,145 +80,159 @@ beforeAll(() => {
 	sessionB = writeDisposableSession(workdir, "b.jsonl", idB);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	if (channelA) await channelA.close();
 	if (workdir) rmSync(workdir, { recursive: true, force: true });
 });
 
 describe("a change aimed at one session", () => {
-	test(
-		"changes that session and leaves the other one alone",
-		async () => {
-			const beforeA = readFileSync(sessionA, "utf8");
-			const beforeB = readFileSync(sessionB, "utf8");
+	test("changes that session and leaves the other one alone", async () => {
+		const beforeA = readFileSync(sessionA, "utf8");
+		const beforeB = readFileSync(sessionB, "utf8");
 
+		// The runtime's own session IS the disposable pi A: the tool changes the
+		// session of the process that owns it.
+		channelA = await openRpcSession({ spawn: spawnPi, sessionPath: sessionA, timeoutMs: 30_000 });
+		const runtime = await liveRuntime(channelA, { id: idA, path: sessionA });
+
+		const result = await applySessionThinking(
+			runtime,
+			"set_session_thinking",
+			{ sessionId: idA, sessionPath: sessionA },
+			"high",
+		);
+
+		expect(result.ok).toBe(true);
+		expect(result.changed).toBe(true);
+		expect(result.applied).toBe("thinking");
+		expect(result.thinking.before).toBe("off");
+		expect(result.thinking.after).toBe("high");
+
+		// the target's own session now says so, in the process that owns it
+		const targetState = await askSession(sessionA);
+		expect(targetState.thinkingLevel).toBe("high");
+
+		// and the other session did not move
+		const otherState = await askSession(sessionB);
+		expect(otherState.thinkingLevel).toBe("off");
+		expect(readFileSync(sessionA, "utf8")).not.toBe(beforeA);
+		expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
+	});
+
+	test("a change aimed at another session is refused, and that session is not touched", async () => {
+		const beforeA = readFileSync(sessionA, "utf8");
+		const beforeB = readFileSync(sessionB, "utf8");
+		const levelBefore = (await askSession(sessionA)).thinkingLevel;
+
+		const channel = await openRpcSession({ spawn: spawnPi, sessionPath: sessionA, timeoutMs: 30_000 });
+		try {
+			const runtime = await liveRuntime(channel, { id: idA, path: sessionA });
 			const result = await applySessionThinking(
 				runtime,
 				"set_session_thinking",
 				{ sessionId: idB, sessionPath: sessionB },
-				"high",
-			);
-
-			expect(result.ok).toBe(true);
-			expect(result.changed).toBe(true);
-			expect(result.applied).toBe("thinking");
-			expect(result.thinking.before).toBe("off");
-			expect(result.thinking.after).toBe("high");
-			expect(result.target.sessionId).toBe(idB);
-			expect(result.target.sessionPath).toBe(sessionB);
-
-			// the target's own session now says so
-			const targetState = await askSession(sessionB);
-			expect(targetState.thinkingLevel).toBe("high");
-
-			// and the other session did not move
-			const otherState = await askSession(sessionA);
-			expect(otherState.thinkingLevel).toBe("off");
-			expect(readFileSync(sessionA, "utf8")).toBe(beforeA);
-			// the target's file carries the change
-			expect(readFileSync(sessionB, "utf8")).not.toBe(beforeB);
-			expect(readFileSync(sessionB, "utf8")).toContain('"thinkingLevel":"high"');
-		},
-		{ timeout: 60_000 },
-	);
-
-	test(
-		"and the other way round",
-		async () => {
-			const beforeA = readFileSync(sessionA, "utf8");
-			const beforeB = readFileSync(sessionB, "utf8");
-			const otherBefore = (await askSession(sessionB)).thinkingLevel;
-
-			const result = await applySessionThinking(
-				runtime,
-				"set_session_thinking",
-				{ sessionId: idA, sessionPath: sessionA },
-				"low",
-			);
-
-			expect(result.ok).toBe(true);
-			expect(result.changed).toBe(true);
-			expect(result.thinking.after).toBe("low");
-
-			const targetState = await askSession(sessionA);
-			expect(targetState.thinkingLevel).toBe("low");
-			const otherState = await askSession(sessionB);
-			expect(otherState.thinkingLevel).toBe(otherBefore);
-			expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
-			expect(readFileSync(sessionA, "utf8")).not.toBe(beforeA);
-		},
-		{ timeout: 60_000 },
-	);
-
-	test(
-		"a target that answers with another session is refused, and nothing changes",
-		async () => {
-			const beforeA = readFileSync(sessionA, "utf8");
-			const beforeB = readFileSync(sessionB, "utf8");
-			const result = await applySessionThinking(
-				runtime,
-				"set_session_thinking",
-				{ sessionId: idA, sessionPath: sessionB },
 				"high",
 			);
 			expect(result.ok).toBe(false);
-			expect(result.refusal?.code).toBe("session_id_mismatch");
-			expect(readFileSync(sessionA, "utf8")).toBe(beforeA);
-			expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
-		},
-		{ timeout: 60_000 },
-	);
+			expect(result.refusal?.code).toBe("target_not_reachable");
+			expect(result.refusal?.detail?.capability).toBe("cross_process_session_control");
+			expect(result.changed).toBe(false);
+		} finally {
+			await channel.close();
+		}
+
+		// neither session moved
+		const stateA = await askSession(sessionA);
+		const stateB = await askSession(sessionB);
+		expect(stateA.thinkingLevel).toBe(levelBefore);
+		expect(stateB.thinkingLevel).toBe("off");
+		expect(readFileSync(sessionA, "utf8")).toBe(beforeA);
+		expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
+	});
 });
 
 describe("a model change aimed at one session", () => {
-	test(
-		"changes that session's model and leaves the other one alone",
-		async () => {
-			const beforeA = readFileSync(sessionA, "utf8");
-			const beforeB = readFileSync(sessionB, "utf8");
+	test("changes that session's model and leaves the other one alone", async () => {
+		const beforeA = readFileSync(sessionA, "utf8");
+		const beforeB = readFileSync(sessionB, "utf8");
 
-			// The model is the target's own: the target's registry decides what it knows.
-			const probe = await openRpcSession({ spawn: spawnPi, sessionPath: sessionB, timeoutMs: 30_000 });
-			let candidate: { provider: string; id: string } | null = null;
-			try {
-				const state = await probe.getState();
-				const current = (state.data as { model?: { provider?: string; id?: string } } | undefined)?.model;
-				const available = await probe.getAvailableModels();
-				const models = ((available.data as { models?: { provider: string; id: string }[] } | undefined)?.models ??
-					[]) as { provider: string; id: string }[];
-				candidate = models.find((m) => m.provider === current?.provider && m.id !== current?.id) ?? null;
-			} finally {
-				await probe.close();
-			}
-			if (!candidate) {
-				// This machine's catalog has no second model for the target's provider: the
-				// change cannot be exercised here. Reported, not silently passed.
-				console.warn("ft55: no second model available for the disposable session; model change not exercised");
-				return;
-			}
+		const channel = await openRpcSession({ spawn: spawnPi, sessionPath: sessionA, timeoutMs: 30_000 });
+		let candidate: { provider: string; id: string } | null = null;
+		try {
+			const state = await channel.getState();
+			const current = (state.data as { model?: { provider?: string; id?: string } } | undefined)?.model;
+			const available = await channel.getAvailableModels();
+			const models = ((available.data as { models?: { provider: string; id: string }[] } | undefined)?.models ??
+				[]) as { provider: string; id: string }[];
+			candidate = models.find((m) => m.provider === current?.provider && m.id !== current?.id) ?? null;
+		} finally {
+			await channel.close();
+		}
+		if (!candidate) {
+			console.warn("ft55: no second model available for the disposable session; model change not exercised");
+			return;
+		}
 
+		const channel2 = await openRpcSession({ spawn: spawnPi, sessionPath: sessionA, timeoutMs: 30_000 });
+		try {
+			const runtime = await liveRuntime(channel2, { id: idA, path: sessionA });
 			const result = await applySessionModel(
 				runtime,
 				"set_session_model",
-				{ sessionId: idB, sessionPath: sessionB },
+				{ sessionId: idA, sessionPath: sessionA },
 				candidate.provider,
 				candidate.id,
 			);
-
 			expect(result.ok).toBe(true);
 			expect(result.changed).toBe(true);
 			expect(result.model.after?.modelId).toBe(candidate.id);
-			expect(result.applied).toBe("model");
+		} finally {
+			await channel2.close();
+		}
 
-			// the target's own session now says so
-			const targetState = await askSession(sessionB);
-			expect((targetState.model as { id?: string } | undefined)?.id).toBe(candidate.id);
-
-			// and the other session did not move
-			const otherState = await askSession(sessionA);
-			expect((otherState.model as { id?: string } | undefined)?.id).not.toBe(candidate.id);
-			expect(readFileSync(sessionA, "utf8")).toBe(beforeA);
-			expect(readFileSync(sessionB, "utf8")).not.toBe(beforeB);
-		},
-		{ timeout: 60_000 },
-	);
+		const targetState = await askSession(sessionA);
+		expect((targetState.model as { id?: string } | undefined)?.id).toBe(candidate.id);
+		const otherState = await askSession(sessionB);
+		expect((otherState.model as { id?: string } | undefined)?.id).not.toBe(candidate.id);
+		expect(readFileSync(sessionA, "utf8")).not.toBe(beforeA);
+		expect(readFileSync(sessionB, "utf8")).toBe(beforeB);
+	});
 });
+
+/** A runtime whose own session is a real disposable pi, driven over its own channel. */
+async function liveRuntime(channel: RpcSession, own: { id: string; path: string }): Promise<ParameterRuntime> {
+	return {
+		own: { sessionId: own.id, sessionPath: own.path, model: null, thinkingLevel: null },
+		getModel: async () => {
+			const state = await channel.getState();
+			const model = (state.data as { model?: { provider?: string; id?: string } } | undefined)?.model;
+			return model?.provider && model?.id ? { provider: model.provider, modelId: model.id } : null;
+		},
+		getThinkingLevel: async () => {
+			const state = await channel.getState();
+			const level = (state.data as { thinkingLevel?: string } | undefined)?.thinkingLevel;
+			return level ?? null;
+		},
+		supportedThinkingLevels: () => ["off", "low", "medium", "high"],
+		resolveModel: async (ref: { provider: string; modelId: string }) => {
+			const available = await channel.getAvailableModels();
+			const models = ((available.data as { models?: { provider: string; id: string }[] } | undefined)?.models ??
+				[]) as { provider: string; id: string }[];
+			const found = models.find((m) => m.provider === ref.provider && m.id === ref.modelId);
+			return found ? { provider: found.provider, modelId: found.id } : null;
+		},
+		setOwnModel: async (ref: { provider: string; modelId: string }) => {
+			const outcome = await channel.setModel(ref.provider, ref.modelId);
+			return outcome.ok;
+		},
+		setOwnThinkingLevel: async (level: string) => {
+			await channel.setThinkingLevel(level);
+		},
+		ownRecords: () => ({ modelChangeEntryId: null, thinkingLevelEntryId: null }),
+		resolveLane: async () => ({
+			ok: false,
+			failure: { code: "herdr_absent", message: "herdr is not available in this environment" },
+		}),
+		readSessionHeaderId: async (path: string) => readSessionHeaderId(path),
+	} as unknown as ParameterRuntime;
+}

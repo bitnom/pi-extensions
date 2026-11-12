@@ -58,6 +58,7 @@ export type RefusalCode =
 	| "session_id_mismatch"
 	| "session_identity_mismatch"
 	| "target_not_reachable"
+	| "held_lane"
 	| "target_session_unresolvable"
 	| "target_lane_unknown"
 	| "target_not_pi"

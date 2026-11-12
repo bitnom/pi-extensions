@@ -4,11 +4,8 @@
 // process, never call a provider and never touch a session file.
 
 import { describe, expect, test } from "bun:test";
-import { makeFakeRpcSession, makeFakeRuntime } from "./fakes.ts";
+import { makeFakeRuntime } from "./fakes.ts";
 import { applyOwnModel, applyOwnThinking, applySessionModel, applySessionThinking } from "./target.ts";
-
-const OWN_ID = "own-session-id";
-const OWN_PATH = "/tmp/own/session.jsonl";
 
 describe("set_own_thinking", () => {
 	test("sets the level and reports the change", async () => {
@@ -114,17 +111,17 @@ describe("set_own_model", () => {
 });
 
 describe("set_session_thinking", () => {
-	test("changes the named session and reports the before and after", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/target/session.jsonl",
+	test("changes the caller's own session, addressed explicitly, in this process", async () => {
+		const runtime = makeFakeRuntime({
+			sessionId: "own-session-id",
+			sessionPath: "/tmp/own/session.jsonl",
 			thinkingLevel: "off",
+			sessionHeaderIds: { "/tmp/own/session.jsonl": "own-session-id" },
 		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
 		const result = await applySessionThinking(
 			runtime,
 			"set_session_thinking",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
+			{ sessionId: "own-session-id", sessionPath: "/tmp/own/session.jsonl" },
 			"high",
 		);
 		expect(result.ok).toBe(true);
@@ -132,73 +129,13 @@ describe("set_session_thinking", () => {
 		expect(result.changed).toBe(true);
 		expect(result.thinking.before).toBe("off");
 		expect(result.thinking.after).toBe("high");
-		expect(result.target.sessionId).toBe("target-id");
+		expect(runtime.calls.setThinkingLevel).toEqual(["high"]);
 		expect(result.target.resolution?.source).toBe("session_file");
-		expect(fake.commands.map((c) => c.type)).toContain("set_thinking_level");
 	});
 
-	test("a target that answers with another session id is refused, and nothing changes", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "other-id",
-			sessionFile: "/tmp/target/session.jsonl",
-			thinkingLevel: "off",
-		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
-		const result = await applySessionThinking(
-			runtime,
-			"set_session_thinking",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
-			"high",
-		);
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("session_id_mismatch");
-		expect(fake.commands.map((c) => c.type)).not.toContain("set_thinking_level");
-	});
-
-	test("a target that answers with another file is refused, and nothing changes", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/other/session.jsonl",
-			thinkingLevel: "off",
-		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
-		const result = await applySessionThinking(
-			runtime,
-			"set_session_thinking",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
-			"high",
-		);
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("session_identity_mismatch");
-		expect(fake.commands.map((c) => c.type)).not.toContain("set_thinking_level");
-	});
-
-	test("two bindings at once is refused before the target is opened", async () => {
-		const runtime = makeFakeRuntime();
-		const result = await applySessionThinking(
-			runtime,
-			"set_session_thinking",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl", lane: "lane-a" },
-			"high",
-		);
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("identity_binding_conflict");
-		expect(runtime.calls.opened).toEqual([]);
-	});
-
-	test("no binding at all is refused before the target is opened", async () => {
-		const runtime = makeFakeRuntime();
-		const result = await applySessionThinking(runtime, "set_session_thinking", { sessionId: "target-id" }, "high");
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("identity_binding_required");
-		expect(runtime.calls.opened).toEqual([]);
-	});
-
-	test("a target that cannot be reached is refused", async () => {
+	test("a session running in another process is refused: pi has no channel to it", async () => {
 		const runtime = makeFakeRuntime({
-			openRemoteSession: async () => {
-				throw new Error("no such session");
-			},
+			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
 		});
 		const result = await applySessionThinking(
 			runtime,
@@ -208,30 +145,65 @@ describe("set_session_thinking", () => {
 		);
 		expect(result.ok).toBe(false);
 		expect(result.refusal?.code).toBe("target_not_reachable");
+		expect(result.refusal?.detail?.capability).toBe("cross_process_session_control");
+		expect(result.refusal?.detail?.targetSessionId).toBe("target-id");
+		expect(result.changed).toBe(false);
+		// and nothing was changed anywhere
+		expect(runtime.calls.setThinkingLevel).toEqual([]);
+		expect(runtime.calls.setModel).toEqual([]);
 	});
 
-	test("the caller's own session is changed in this process, not over the channel", async () => {
-		const runtime = makeFakeRuntime({ sessionId: OWN_ID, sessionPath: OWN_PATH });
+	test("a session file that holds another session is refused", async () => {
+		const runtime = makeFakeRuntime({
+			sessionHeaderIds: { "/tmp/target/session.jsonl": "other-id" },
+		});
 		const result = await applySessionThinking(
 			runtime,
 			"set_session_thinking",
-			{ sessionId: OWN_ID, sessionPath: OWN_PATH },
+			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
 			"high",
 		);
-		expect(result.ok).toBe(true);
-		expect(result.applied).toBe("thinking");
-		expect(runtime.calls.setThinkingLevel).toEqual(["high"]);
-		expect(runtime.calls.opened).toEqual([]);
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("session_id_mismatch");
+		expect(runtime.calls.setThinkingLevel).toEqual([]);
 	});
 
-	test("a lane binding resolves the lane to a session and then changes it", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/lane/session.jsonl",
-			thinkingLevel: "off",
-		});
+	test("a session file with no session id is refused", async () => {
+		const runtime = makeFakeRuntime({ sessionHeaderIds: {} });
+		const result = await applySessionThinking(
+			runtime,
+			"set_session_thinking",
+			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
+			"high",
+		);
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("no_session_file");
+	});
+
+	test("two bindings at once is refused before the target is resolved", async () => {
+		const runtime = makeFakeRuntime();
+		const result = await applySessionThinking(
+			runtime,
+			"set_session_thinking",
+			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl", lane: "lane-a" },
+			"high",
+		);
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("identity_binding_conflict");
+		expect(runtime.calls.laneResolutions).toEqual([]);
+	});
+
+	test("no binding at all is refused before the target is resolved", async () => {
+		const runtime = makeFakeRuntime();
+		const result = await applySessionThinking(runtime, "set_session_thinking", { sessionId: "target-id" }, "high");
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("identity_binding_required");
+		expect(runtime.calls.laneResolutions).toEqual([]);
+	});
+
+	test("a lane binding resolves the lane to a session, and then the capability is reported", async () => {
 		const runtime = makeFakeRuntime({
-			openRemoteSession: async () => fake,
+			sessionHeaderIds: { "/tmp/lane/session.jsonl": "target-id" },
 			resolveLane: async () => ({
 				ok: true,
 				lane: { sessionPath: "/tmp/lane/session.jsonl", kind: "pi", paneId: "w1A:p1" },
@@ -243,13 +215,15 @@ describe("set_session_thinking", () => {
 			{ sessionId: "target-id", lane: "lane-a" },
 			"high",
 		);
-		expect(result.ok).toBe(true);
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("target_not_reachable");
 		expect(result.target.resolution?.source).toBe("lane");
 		expect(result.target.resolution?.lane).toBe("lane-a");
 		expect(runtime.calls.laneResolutions).toEqual(["lane-a"]);
+		expect(runtime.calls.setThinkingLevel).toEqual([]);
 	});
 
-	test("a lane that cannot be resolved is refused, and nothing is opened", async () => {
+	test("a lane that cannot be resolved is refused", async () => {
 		const runtime = makeFakeRuntime({
 			resolveLane: async () => ({
 				ok: false,
@@ -264,22 +238,42 @@ describe("set_session_thinking", () => {
 		);
 		expect(result.ok).toBe(false);
 		expect(result.refusal?.code).toBe("target_lane_unknown");
-		expect(runtime.calls.opened).toEqual([]);
+	});
+
+	test("a lane in a held place is refused", async () => {
+		const runtime = makeFakeRuntime({
+			sessionHeaderIds: { "/tmp/lane/session.jsonl": "target-id" },
+			resolveLane: async () => ({
+				ok: true,
+				lane: { sessionPath: "/tmp/lane/session.jsonl", kind: "pi", paneId: "w2:p1" },
+			}),
+		});
+		const result = await applySessionThinking(
+			runtime,
+			"set_session_thinking",
+			{ sessionId: "target-id", lane: "lane-a" },
+			"high",
+		);
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("held_lane");
 	});
 });
 
 describe("set_session_model", () => {
-	test("changes the named session's model", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/target/session.jsonl",
-			model: { provider: "anthropic", modelId: "claude-sonnet-4" },
+	test("changes the caller's own model, addressed explicitly, in this process", async () => {
+		const runtime = makeFakeRuntime({
+			sessionId: "own-session-id",
+			sessionPath: "/tmp/own/session.jsonl",
+			sessionHeaderIds: { "/tmp/own/session.jsonl": "own-session-id" },
+			knownModels: [
+				{ provider: "anthropic", modelId: "claude-sonnet-4" },
+				{ provider: "anthropic", modelId: "claude-opus-4" },
+			],
 		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
 		const result = await applySessionModel(
 			runtime,
 			"set_session_model",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
+			{ sessionId: "own-session-id", sessionPath: "/tmp/own/session.jsonl" },
 			"anthropic",
 			"claude-opus-4",
 		);
@@ -287,54 +281,13 @@ describe("set_session_model", () => {
 		expect(result.applied).toBe("model");
 		expect(result.changed).toBe(true);
 		expect(result.model.after?.modelId).toBe("claude-opus-4");
-		expect(result.records.modelChangeEntryId).not.toBeNull();
+		expect(runtime.calls.setModel).toEqual([{ provider: "anthropic", modelId: "claude-opus-4" }]);
 	});
 
-	test("the same model again is a no-op: the target is not changed", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/target/session.jsonl",
-			model: { provider: "anthropic", modelId: "claude-sonnet-4" },
+	test("a session running in another process is refused: pi has no channel to it", async () => {
+		const runtime = makeFakeRuntime({
+			sessionHeaderIds: { "/tmp/target/session.jsonl": "target-id" },
 		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
-		const result = await applySessionModel(
-			runtime,
-			"set_session_model",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
-			"anthropic",
-			"claude-sonnet-4",
-		);
-		expect(result.ok).toBe(true);
-		expect(result.applied).toBe("none");
-		expect(result.changed).toBe(false);
-		expect(fake.commands.map((c) => c.type)).not.toContain("set_model");
-	});
-
-	test("a model the target's registry does not know is refused", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/target/session.jsonl",
-			failModel: "Model not found: anthropic/nope",
-		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
-		const result = await applySessionModel(
-			runtime,
-			"set_session_model",
-			{ sessionId: "target-id", sessionPath: "/tmp/target/session.jsonl" },
-			"anthropic",
-			"nope",
-		);
-		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("model_unknown");
-	});
-
-	test("a provider without credentials in the target is refused", async () => {
-		const fake = makeFakeRpcSession({
-			sessionId: "target-id",
-			sessionFile: "/tmp/target/session.jsonl",
-			failModel: "No API key for anthropic/claude-opus-4",
-		});
-		const runtime = makeFakeRuntime({ openRemoteSession: async () => fake });
 		const result = await applySessionModel(
 			runtime,
 			"set_session_model",
@@ -343,24 +296,17 @@ describe("set_session_model", () => {
 			"claude-opus-4",
 		);
 		expect(result.ok).toBe(false);
-		expect(result.refusal?.code).toBe("auth_missing");
+		expect(result.refusal?.code).toBe("target_not_reachable");
+		expect(runtime.calls.setModel).toEqual([]);
 	});
 });
 
 describe("isolation", () => {
-	test("a change aimed at B changes B and leaves A alone", async () => {
-		const a = makeFakeRpcSession({
-			sessionId: "a-id",
-			sessionFile: "/tmp/a/session.jsonl",
-			thinkingLevel: "off",
-		});
-		const b = makeFakeRpcSession({
-			sessionId: "b-id",
-			sessionFile: "/tmp/b/session.jsonl",
-			thinkingLevel: "off",
-		});
+	test("a change aimed at another session changes nothing here", async () => {
 		const runtime = makeFakeRuntime({
-			openRemoteSession: async (path) => (path === "/tmp/b/session.jsonl" ? b : a),
+			sessionId: "own-session-id",
+			sessionPath: "/tmp/a/session.jsonl",
+			sessionHeaderIds: { "/tmp/b/session.jsonl": "b-id" },
 		});
 		const result = await applySessionThinking(
 			runtime,
@@ -368,35 +314,25 @@ describe("isolation", () => {
 			{ sessionId: "b-id", sessionPath: "/tmp/b/session.jsonl" },
 			"high",
 		);
-		expect(result.ok).toBe(true);
-		expect(b.state.thinkingLevel).toBe("high");
-		expect(a.state.thinkingLevel).toBe("off");
-		expect(a.commands.map((c) => c.type)).not.toContain("set_thinking_level");
+		expect(result.ok).toBe(false);
+		expect(result.refusal?.code).toBe("target_not_reachable");
+		expect(runtime.calls.setThinkingLevel).toEqual([]);
+		expect(runtime.state.thinkingLevel).toBe("off");
 	});
 
-	test("and the other way round", async () => {
-		const a = makeFakeRpcSession({
-			sessionId: "a-id",
-			sessionFile: "/tmp/a/session.jsonl",
-			thinkingLevel: "off",
-		});
-		const b = makeFakeRpcSession({
-			sessionId: "b-id",
-			sessionFile: "/tmp/b/session.jsonl",
-			thinkingLevel: "off",
-		});
+	test("and a change aimed at this session changes only this session", async () => {
 		const runtime = makeFakeRuntime({
-			openRemoteSession: async (path) => (path === "/tmp/a/session.jsonl" ? a : b),
+			sessionId: "a-id",
+			sessionPath: "/tmp/a/session.jsonl",
+			sessionHeaderIds: { "/tmp/a/session.jsonl": "a-id" },
 		});
 		const result = await applySessionThinking(
 			runtime,
 			"set_session_thinking",
 			{ sessionId: "a-id", sessionPath: "/tmp/a/session.jsonl" },
-			"low",
+			"high",
 		);
 		expect(result.ok).toBe(true);
-		expect(a.state.thinkingLevel).toBe("low");
-		expect(b.state.thinkingLevel).toBe("off");
-		expect(b.commands.map((c) => c.type)).not.toContain("set_thinking_level");
+		expect(runtime.state.thinkingLevel).toBe("high");
 	});
 });

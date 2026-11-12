@@ -1,13 +1,20 @@
 // rpc.ts — pi's own control channel.
 //
 // pi exposes a documented RPC mode: `pi --mode rpc` speaks JSONL on stdin/stdout and
-// answers commands such as `get_state`, `set_model` and `set_thinking_level`. That is
-// the supported way to drive a session's parameters from outside the session's own
-// process, so it is the mechanism this package uses to reach a target session.
+// answers commands such as `get_state`, `set_model` and `set_thinking_level`. It is the
+// supported way to drive a pi session's parameters from outside that session's own
+// process — and its channel is the **parent's**: the parent of an RPC-mode child talks
+// to it over that child's stdin.
 //
 // This module is deliberately small and injectable: the spawn function is a parameter,
 // so the tests can drive the whole protocol without a process, and the integration
-// test can drive a real disposable pi.
+// test can drive and observe a real disposable pi.
+//
+// It is **not** a mutation path of this package. A second process opened on somebody
+// else's session file is not that session's process, and writing to a session file that
+// a running lane owns makes two writers of one session. The client is here because it
+// is how a real pi is driven and observed, and because it is the shape an in-process
+// receiver would use.
 
 /** The subset of a child process this module uses. A fake satisfies it in tests. */
 export interface RpcChild {

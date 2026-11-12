@@ -2,12 +2,13 @@
 	"name": "@arhen/pi-add-parameter-tools",
 	"version": "1.0.0",
 	"type": "module",
-	"description": "pi extension: set the running agent's model and thinking level, and set another pi session's model and thinking level by explicit target binding.",
+	"description": "pi extension: set a pi session's model and thinking level, by explicit target binding. The caller's own session is changed in process; a session in another process is refused, because pi exposes no channel to it.",
 	"license": "MIT",
 	"main": "./src/index.ts",
 	"files": [
 		"src",
 		"!src/**/*.test.ts",
+		"!src/fakes.ts",
 		"README.md",
 		"LICENSE"
 	],
